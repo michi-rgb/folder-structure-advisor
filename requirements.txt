@@ -1,3 +1,4 @@
 # 本体はすべて標準ライブラリで動作します（追加依存なしで scan / report / run 可能）。
-# 以下は「LLM補助（Azure OpenAI）」を使う場合のみ必要です。
-openai>=1.30.0
+# 以下は「LLM補助」を使う場合のみ、使うプロバイダに応じてインストールしてください。
+openai>=1.30.0       # Azure OpenAI を使う場合
+mistralai>=1.0.0     # Mistral を使う場合

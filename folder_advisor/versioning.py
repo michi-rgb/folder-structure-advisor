@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from .filters import is_generic_basename, is_structural
 from .models import FileEntry, VersionSeries
 
 # 版・状態を表すトークン（正規化時に除去する対象）。
@@ -31,6 +32,13 @@ _KANJI_VER = re.compile(r"第?\s*(\d+)\s*版")
 _LATEST_WORDS = re.compile(r"(最新|最終|確定|正式|final|fix)", re.IGNORECASE)
 # 「旧」を示す語。
 _OLD_WORDS = re.compile(r"(旧|old|作業中|wip|draft|下書き|ドラフト|コピー|copy)", re.IGNORECASE)
+
+
+def has_version_marker(stem: str) -> bool:
+    """ファイル名に版・日付・状態の表記（v2 / 第2版 / 20240401 / 旧 等）が含まれるか。"""
+    if _DATE_PATTERN.search(stem):
+        return True
+    return any(pat.search(stem) for pat in _VERSION_PATTERNS)
 
 
 def normalize_name(stem: str) -> str:
@@ -71,10 +79,21 @@ def _version_score(entry: FileEntry) -> tuple:
     return (is_latest_word + is_old_word, ver, date_val, mtime)
 
 
-def detect_version_series(files: list[FileEntry]) -> list[VersionSeries]:
-    """同一基準名でまとまり、かつ複数版があるものを系列として返す。"""
+def detect_version_series(
+    files: list[FileEntry], exclude_structural: bool = True
+) -> list[VersionSeries]:
+    """同一資料の別版とみなせるものだけを系列として返す。
+
+    誤検出（複数フォルダに同名ファイルがあるだけ）を避けるため、系列と認めるには
+    次を満たす必要がある:
+    - メンバーのファイル名（語幹）が 2 種類以上ある（＝全部同名なら版ではない）
+    - いずれかのメンバーに版・日付・状態の表記がある（has_version_marker）
+    さらに構成ファイル（.gitignore / __init__.py 等）は対象外。
+    """
     groups: dict[str, list[FileEntry]] = {}
     for f in files:
+        if exclude_structural and is_structural(f.name):
+            continue
         base = normalize_name(f.stem)
         if not base:
             continue
@@ -87,12 +106,21 @@ def detect_version_series(files: list[FileEntry]) -> list[VersionSeries]:
     for key, members in groups.items():
         if len(members) < 2:
             continue
+        base_name = key.split("|", 1)[0]
+        # スクリーンショット等の汎用・自動生成名は資料の「版」ではない。
+        if is_generic_basename(base_name):
+            continue
+        # 全メンバーが同一ファイル名 = 各フォルダに同名があるだけ（版ではない）。
+        if len({f.stem for f in members}) < 2:
+            continue
+        # 実際に版・日付・状態の表記があるものだけを系列とみなす。
+        if not any(has_version_marker(f.stem) for f in members):
+            continue
         idx += 1
         sid = f"series-{idx:04d}"
         ranked = sorted(members, key=_version_score, reverse=True)
         latest = ranked[0]
         older = ranked[1:]
-        base_name = key.split("|", 1)[0]
         for f in members:
             f.version_series = sid
             f.is_latest_in_series = f.path == latest.path

@@ -27,6 +27,16 @@ def _make_tree(root: Path) -> None:
         "c/img/logo.png": "IMG",             # 完全重複
         "d/契約書.pdf": "CONTRACT",
         "~$tmp.docx": "TEMP",                # 除外対象
+        # 構成ファイル（各所に存在して当然 → 重複/旧版に出してはいけない）
+        "a/.gitignore": "IGNORE_A",
+        "b/.gitignore": "IGNORE_B",
+        "a/__init__.py": "",                 # 空ファイル（0バイト）
+        "b/__init__.py": "",                 # 同名・同内容だが構成ファイル
+        "c/README.md": "READ_C",
+        "d/README.md": "READ_D",
+        # 汎用・自動生成名（版ではない）
+        "e/スクリーンショット 2024-01-01.png": "S1",
+        "e/スクリーンショット 2024-02-02.png": "S2",
     }
     for rel, content in files.items():
         p = root / rel
@@ -47,7 +57,7 @@ class CoreTest(unittest.TestCase):
         scan = scan_source(str(self.root))
         names = {f.name for f in scan.files}
         self.assertNotIn("~$tmp.docx", names)
-        self.assertEqual(len(scan.files), 6)
+        self.assertEqual(len(scan.files), 14)
 
     def test_reliability_marks_mtime_low(self) -> None:
         scan = enrich(scan_source(str(self.root)))
@@ -73,6 +83,41 @@ class CoreTest(unittest.TestCase):
         series = detect_version_series(scan.files)
         bases = {s.base_name for s in series}
         self.assertIn("見積書", bases)
+
+    def test_structural_files_not_duplicated(self) -> None:
+        # .gitignore / __init__.py（空）は完全重複グループに現れない。
+        scan = enrich(scan_source(str(self.root)))
+        dups = detect_exact_duplicates(scan.files)
+        dup_paths = {p for g in dups for p in g.paths}
+        for p in dup_paths:
+            self.assertFalse(
+                p.endswith(".gitignore") or p.endswith("__init__.py"),
+                f"構成ファイルが重複に混入: {p}",
+            )
+
+    def test_generic_and_samename_not_versioned(self) -> None:
+        scan = enrich(scan_source(str(self.root)))
+        series = detect_version_series(scan.files)
+        bases = {s.base_name for s in series}
+        # スクリーンショット（汎用名）/ README（同名多数・構成）は系列にならない。
+        self.assertNotIn("スクリーンショット", bases)
+        self.assertNotIn("readme", bases)
+        # 見積書は本物の版なので系列に残る。
+        self.assertIn("見積書", bases)
+
+    def test_structural_kept_in_place(self) -> None:
+        from folder_advisor.classifier import classify_all
+        from folder_advisor.proposer import build_proposal
+
+        scan = enrich(scan_source(str(self.root)))
+        counts = classify_all(scan.files)
+        dups = detect_exact_duplicates(scan.files)
+        series = detect_version_series(scan.files)
+        analysis = build_proposal(scan, dups, series, counts)
+        for m in analysis.move_plan:
+            if m.current_path.endswith(".gitignore"):
+                self.assertEqual(m.action, "据置")
+                self.assertEqual(m.current_path, m.proposed_path)
 
     def test_proposal_no_file_mutation(self) -> None:
         scan = enrich(scan_source(str(self.root)))

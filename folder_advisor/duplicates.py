@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 
+from .filters import is_structural
 from .models import DuplicateGroup, FileEntry
 from .versioning import normalize_name
 
@@ -30,12 +31,28 @@ def _primary_score(entry: FileEntry) -> tuple:
     return (-depth, official, -unofficial, -len(entry.name), entry.path)
 
 
-def detect_exact_duplicates(files: list[FileEntry]) -> list[DuplicateGroup]:
-    """内容ハッシュ一致の完全重複グループを返す。"""
+def detect_exact_duplicates(
+    files: list[FileEntry],
+    min_size: int = 1,
+    exclude_structural: bool = True,
+) -> list[DuplicateGroup]:
+    """内容ハッシュ一致の完全重複グループを返す。
+
+    ノイズ除外:
+    - `min_size` 未満（既定 1）＝ 0 バイトの空ファイルは対象外。空ファイルは
+      全て同一ハッシュになり、無関係なファイルが 1 グループに束ねられてしまうため。
+    - 構成ファイル（.gitignore / __init__.py 等）は各所に存在して当然で「統合」
+      すべきでないため対象外。
+    """
     by_hash: dict[str, list[FileEntry]] = defaultdict(list)
     for f in files:
-        if f.content_hash:
-            by_hash[f.content_hash].append(f)
+        if not f.content_hash:
+            continue
+        if f.size < min_size:
+            continue
+        if exclude_structural and is_structural(f.name):
+            continue
+        by_hash[f.content_hash].append(f)
 
     groups: list[DuplicateGroup] = []
     idx = 0

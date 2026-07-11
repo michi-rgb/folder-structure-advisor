@@ -14,6 +14,7 @@ import re
 from typing import Optional
 
 from .classifier import UNCLASSIFIED
+from .filters import is_structural
 from .models import (
     AnalysisResult,
     DuplicateGroup,
@@ -83,9 +84,25 @@ def build_proposal(
             old_version_paths.add(p)
 
     move_plan: list[MovePlanItem] = []
-    kept_files: list[FileEntry] = []  # 提案ツリー構築に使う（統合で消えるものは除く）
+    # 提案ツリー構築に使う提案パス（統合で消える冗長コピーは含めない）。
+    kept_proposed: list[str] = []
 
     for f in scan.files:
+        # 構成ファイル（.gitignore / __init__.py 等）は移動せず据え置く。
+        # 各フォルダに存在することに意味があり、集約するとプロジェクトが壊れるため。
+        if is_structural(f.name):
+            move_plan.append(
+                MovePlanItem(
+                    current_path=f.path,
+                    proposed_path=f.path,
+                    category=f.category or UNCLASSIFIED,
+                    action="据置",
+                    reason="プロジェクト構成ファイル（各フォルダに存在して当然）のため据置",
+                )
+            )
+            kept_proposed.append(f.path)
+            continue
+
         is_redundant = f.path in redundant_paths
         is_old = f.path in old_version_paths
 
@@ -128,11 +145,9 @@ def build_proposal(
                 old_version_flag=is_old,
             )
         )
-        kept_files.append(f)
+        kept_proposed.append(proposed)
 
-    proposed_tree = _build_tree(
-        [(_proposed_path_for(f, f.path in old_version_paths)) for f in kept_files]
-    )
+    proposed_tree = _build_tree(kept_proposed)
 
     # 命名規約案（LLM が無ければ既定案）。
     naming = naming_suggestion or _default_naming_suggestion()

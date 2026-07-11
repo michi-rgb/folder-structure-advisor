@@ -38,14 +38,15 @@ def _save_json(obj: dict, path: Path) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _analyze(scan: ScanResult, use_llm: bool) -> AnalysisResult:
+def _analyze(scan: ScanResult, use_llm: bool, llm_provider: str = "auto") -> AnalysisResult:
     category_counts = classify_all(scan.files)
 
     naming_suggestion = None
     llm_used = False
     if use_llm:
-        helper = LLMHelper()
+        helper = LLMHelper(provider_name=llm_provider)
         if helper.available:
+            print(f"  [情報] LLM補助プロバイダ: {helper.provider_name}", file=sys.stderr)
             # 意味分類でカテゴリを上書き（取れた分だけ）。
             names = [f.name for f in scan.files]
             cats = helper.suggest_categories(names)
@@ -65,8 +66,8 @@ def _analyze(scan: ScanResult, use_llm: bool) -> AnalysisResult:
             if naming_suggestion:
                 llm_used = True
         else:
-            print("  [情報] Azure OpenAI 接続情報が無いためルールベースで実行します。",
-                  file=sys.stderr)
+            print("  [情報] LLM接続情報（Azure OpenAI / Mistral）が無いため"
+                  "ルールベースで実行します。", file=sys.stderr)
 
     dups = detect_exact_duplicates(scan.files)
     series = detect_version_series(scan.files)
@@ -94,7 +95,7 @@ def cmd_report(args) -> int:
         print("エラー: --scan か --source のいずれかを指定してください。", file=sys.stderr)
         return 2
 
-    analysis = _analyze(scan, use_llm=args.llm)
+    analysis = _analyze(scan, use_llm=args.llm, llm_provider=args.llm_provider)
     out_dir = Path(args.out)
     _save_json(analysis.to_dict(), out_dir / "analysis.json")
     paths = write_report(scan, analysis, out_dir)
@@ -106,7 +107,7 @@ def cmd_run(args) -> int:
     scan = _do_scan(args.source, args.mode, args.max_files, not args.no_hash)
     out_dir = Path(args.out)
     _save_json(scan.to_dict(), out_dir / "scan.json")
-    analysis = _analyze(scan, use_llm=args.llm)
+    analysis = _analyze(scan, use_llm=args.llm, llm_provider=args.llm_provider)
     _save_json(analysis.to_dict(), out_dir / "analysis.json")
     paths = write_report(scan, analysis, out_dir)
     _print_summary(analysis, paths)
@@ -159,7 +160,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--source", help="対象フォルダ（--scan 未指定時に走査）")
     _add_common(p_report)
     p_report.add_argument("--llm", action="store_true",
-                          help="Azure OpenAI 補助を使う（接続情報が必要）")
+                          help="LLM補助を使う（接続情報が必要）")
+    p_report.add_argument("--llm-provider", choices=["auto", "azure", "mistral"],
+                          default="auto", dest="llm_provider",
+                          help="LLM補助のプロバイダ（既定 auto）")
     p_report.set_defaults(func=cmd_report)
 
     p_run = sub.add_parser("run", help="走査→分析→レポートを一括実行")
@@ -167,7 +171,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--source", required=True,
                        help="対象フォルダ（ローカル / SharePoint 同期パス）")
     p_run.add_argument("--llm", action="store_true",
-                       help="Azure OpenAI 補助を使う（接続情報が必要）")
+                       help="LLM補助を使う（接続情報が必要）")
+    p_run.add_argument("--llm-provider", choices=["auto", "azure", "mistral"],
+                       default="auto", dest="llm_provider",
+                       help="LLM補助のプロバイダ（既定 auto）")
     p_run.set_defaults(func=cmd_run)
 
     return parser
