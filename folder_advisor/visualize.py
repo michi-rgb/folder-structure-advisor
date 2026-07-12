@@ -1,132 +1,64 @@
-"""before / after の可視化。
+"""before / after の可視化データ生成。
 
-- mermaid（flowchart TD）テキストを生成。大規模ツリーは深さ・子ノード数の上限で
-  「他 N 件」の集約ノードに折り畳み、mermaid が破綻しないようにする。
+- 折り畳みツリー・容量ヒートマップ（Treemap）用の、名前昇順で正規化した
+  ネスト木データを生成する。
 - グラフ JSON（nodes / edges）も生成し、他ツール連携・再描画に使える形で出す。
 """
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 
 from .models import ScanResult
 
-DEFAULT_MAX_DEPTH = 3
-DEFAULT_MAX_CHILDREN = 12
-# mermaid のフロー方向。LR=左から右、TD=上から下。
-DEFAULT_DIRECTION = "LR"
 
-
-# --- mermaid 用のユーティリティ ---------------------------------------------
-def _mid(counter: list[int]) -> str:
-    counter[0] += 1
-    return f"n{counter[0]}"
-
-
-def _esc(label: str) -> str:
-    """mermaid ラベル内で問題になる文字を無害化する。"""
-    label = label.replace('"', "'").replace("\n", " ")
-    # 角括弧・波括弧はノード構文と衝突するため全角化。
-    label = label.replace("[", "［").replace("]", "］")
-    return label
-
-
-def _tree_from_dirs(scan: ScanResult) -> dict:
-    """走査結果（before）を親子ネスト辞書にする。値は子 dict、__files__ に件数。"""
+# --- ネスト木データ（折り畳みツリー / Treemap 用） ---------------------------
+# 縦に伸びる折り畳みツリーや面積表現の Treemap で使うため、名前昇順で正規化した
+# ネスト木を生成する。ノードリンク図（mermaid 等）は大規模ツリーで字が潰れ・
+# エッジが重なるため用いない。各ノードは name / count（直下ファイル数）/
+# total（配下総ファイル数＝面積の重み）/ children を持つ。
+def before_tree_data(scan: ScanResult) -> dict:
+    """走査結果（現状）を name 昇順のネスト木データにする。"""
     children: dict[str, list[str]] = defaultdict(list)
-    file_counts: dict[str, int] = {}
     names: dict[str, str] = {}
+    file_counts: dict[str, int] = {}
+    total_counts: dict[str, int] = {}
     for d in scan.dirs:
         names[d.path] = d.name
         file_counts[d.path] = d.file_count
+        total_counts[d.path] = d.total_file_count
         if d.path != "":
             children[d.parent].append(d.path)
-    return {"children": children, "file_counts": file_counts, "names": names}
+
+    def node(path: str) -> dict:
+        kids = sorted(children.get(path, []), key=lambda c: names.get(c, c))
+        return {
+            "name": names.get(path, "") or "（ルート）",
+            "count": file_counts.get(path, 0),
+            "total": total_counts.get(path, 0),
+            "children": [node(c) for c in kids],
+        }
+
+    return node("")
 
 
-def before_mermaid(
-    scan: ScanResult,
-    max_depth: int = DEFAULT_MAX_DEPTH,
-    max_children: int = DEFAULT_MAX_CHILDREN,
-    direction: str = DEFAULT_DIRECTION,
-) -> str:
-    """走査結果（現状）を mermaid flowchart にする。"""
-    info = _tree_from_dirs(scan)
-    children = info["children"]
-    file_counts = info["file_counts"]
-    names = info["names"]
-    counter = [0]
-    lines = [f"flowchart {direction}"]
+def after_tree_data(proposed_tree: dict, root_name: str = "（改善後ルート）") -> dict:
+    """提案ツリー（ネスト辞書）を name 昇順のネスト木データにする。"""
 
-    def emit(path: str, depth: int) -> str:
-        nid = _mid(counter)
-        label = names.get(path, path) or "（ルート）"
-        fc = file_counts.get(path, 0)
-        suffix = f"<br/>{fc}ファイル" if fc else ""
-        lines.append(f'    {nid}["{_esc(label)}{suffix}"]')
-        if depth >= max_depth:
-            subdirs = children.get(path, [])
-            if subdirs:
-                cid = _mid(counter)
-                lines.append(f'    {cid}["... 他 {len(subdirs)} フォルダ"]')
-                lines.append(f"    {nid} --> {cid}")
-            return nid
-        kids = children.get(path, [])
-        for child in kids[:max_children]:
-            child_id = emit(child, depth + 1)
-            lines.append(f"    {nid} --> {child_id}")
-        if len(kids) > max_children:
-            cid = _mid(counter)
-            lines.append(f'    {cid}["... 他 {len(kids) - max_children} フォルダ"]')
-            lines.append(f"    {nid} --> {cid}")
-        return nid
+    def node(name: str, sub: dict) -> dict:
+        files = sub.get("__files__", [])
+        kids = sorted(k for k in sub if k != "__files__")
+        children = [node(k, sub[k]) for k in kids]
+        total = len(files) + sum(c["total"] for c in children)
+        return {
+            "name": name,
+            "count": len(files),
+            "total": total,
+            "children": children,
+        }
 
-    emit("", 0)
-    return "\n".join(lines)
-
-
-def after_mermaid(
-    proposed_tree: dict,
-    max_depth: int = DEFAULT_MAX_DEPTH,
-    max_children: int = DEFAULT_MAX_CHILDREN,
-    direction: str = DEFAULT_DIRECTION,
-) -> str:
-    """提案ツリー（ネスト辞書）を mermaid flowchart にする。"""
-    counter = [0]
-    lines = [f"flowchart {direction}"]
-    root_id = _mid(counter)
-    lines.append(f'    {root_id}["（改善後ルート）"]')
-
-    def emit(node: dict, parent_id: str, depth: int) -> None:
-        subdirs = [(k, v) for k, v in node.items() if k != "__files__"]
-        files = node.get("__files__", [])
-        if depth >= max_depth:
-            total = len(subdirs)
-            if total:
-                cid = _mid(counter)
-                lines.append(f'    {cid}["... 他 {total} フォルダ"]')
-                lines.append(f"    {parent_id} --> {cid}")
-            return
-        for name, child in subdirs[:max_children]:
-            nid = _mid(counter)
-            fc = len(child.get("__files__", []))
-            suffix = f"<br/>{fc}ファイル" if fc else ""
-            lines.append(f'    {nid}["{_esc(name)}{suffix}"]')
-            lines.append(f"    {parent_id} --> {nid}")
-            emit(child, nid, depth + 1)
-        if len(subdirs) > max_children:
-            cid = _mid(counter)
-            lines.append(f'    {cid}["... 他 {len(subdirs) - max_children} フォルダ"]')
-            lines.append(f"    {parent_id} --> {cid}")
-        # ルート直下ファイルがある場合のみ件数表示。
-        if files and depth == 0:
-            fid = _mid(counter)
-            lines.append(f'    {fid}["直下 {len(files)} ファイル"]')
-            lines.append(f"    {parent_id} --> {fid}")
-
-    emit(proposed_tree, root_id, 0)
-    return "\n".join(lines)
+    root = node(root_name, proposed_tree)
+    return root
 
 
 # --- グラフ JSON -------------------------------------------------------------
@@ -134,7 +66,7 @@ def before_graph_json(scan: ScanResult) -> dict:
     """現状フォルダ構造を nodes/edges の JSON にする。"""
     nodes = []
     edges = []
-    for d in scan.dirs:
+    for d in sorted(scan.dirs, key=lambda d: (d.depth, d.name)):
         nid = d.path or "__root__"
         nodes.append(
             {
@@ -158,9 +90,8 @@ def after_graph_json(proposed_tree: dict) -> dict:
     counter = [0]
 
     def walk(node: dict, parent_id: str, depth: int) -> None:
-        for name, child in node.items():
-            if name == "__files__":
-                continue
+        for name in sorted(k for k in node if k != "__files__"):
+            child = node[name]
             counter[0] += 1
             nid = f"{parent_id}/{name}"
             fc = len(child.get("__files__", []))

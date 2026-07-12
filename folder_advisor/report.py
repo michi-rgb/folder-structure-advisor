@@ -1,8 +1,7 @@
 """HTML レポート生成と移動計画 CSV 出力。
 
-レポートは 1 ファイルで完結する HTML。mermaid 図はブラウザで描画するため
-mermaid.js を CDN から読み込むが、読み込めない環境（社内ネットワーク等）でも
-図のソースを折り畳みで確認できるようフォールバックを用意する。
+レポートは 1 ファイルで完結する HTML。外部 CDN やスクリプトに依存せず、
+折り畳みツリーと SVG の容量ヒートマップ（Treemap）で before/after を可視化する。
 """
 
 from __future__ import annotations
@@ -16,12 +15,10 @@ from .models import AnalysisResult, ScanResult
 from .scoring import score_structure
 from .visualize import (
     after_graph_json,
-    after_mermaid,
+    after_tree_data,
     before_graph_json,
-    before_mermaid,
+    before_tree_data,
 )
-
-_MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
 
 
 def _h(text) -> str:
@@ -59,16 +56,161 @@ def write_move_plan_csv(analysis: AnalysisResult, out_path: Path) -> None:
             )
 
 
-def _mermaid_block(title: str, code: str) -> str:
-    esc_code = _h(code)
-    return f"""
-      <div class="diagram">
-        <h3>{_h(title)}</h3>
-        <div class="mermaid">{esc_code}</div>
-        <details><summary>mermaid ソース（コピー用・図が表示されない場合）</summary>
-          <pre class="mmsrc">{esc_code}</pre>
-        </details>
-      </div>"""
+# --- 折り畳みツリー（大規模向けの主表現） -----------------------------------
+# mermaid と違い縦に伸びるだけなので、数千ノードでも字が潰れずエッジも交差しない。
+# JS 不要（<details> のネイティブ開閉）。既定では浅い階層だけ開いて表示する。
+_TREE_OPEN_DEPTH = 2  # この深さまでは既定で開いておく
+
+
+def _html_tree(node: dict, depth: int = 0) -> str:
+    name = _h(node.get("name", ""))
+    count = node.get("count", 0)
+    total = node.get("total", 0)
+    children = node.get("children", [])
+    # 件数バッジ（直下 / 配下合計）。0 は表示しない。
+    badges = ""
+    if count:
+        badges += f'<span class="b b-file">{_h(count)}</span>'
+    if total and total != count:
+        badges += f'<span class="b b-total">Σ{_h(total)}</span>'
+    label = f'<span class="tname">{name}</span>{badges}'
+    if not children:
+        return f'<li class="leaf">{label}</li>'
+    open_attr = " open" if depth < _TREE_OPEN_DEPTH else ""
+    inner = "".join(_html_tree(c, depth + 1) for c in children)
+    return (
+        f'<li><details{open_attr}><summary>{label}'
+        f'<span class="cc">{len(children)}フォルダ</span></summary>'
+        f"<ul>{inner}</ul></details></li>"
+    )
+
+
+def _tree_block(title: str, node: dict) -> str:
+    return (
+        f'<div class="tree"><h3>{_h(title)}</h3>'
+        f'<div class="tree-tools">'
+        f'<button type="button" onclick="treeToggle(this,true)">すべて展開</button>'
+        f'<button type="button" onclick="treeToggle(this,false)">すべて折り畳み</button>'
+        f'</div>'
+        f'<ul class="filetree">{_html_tree(node)}</ul></div>'
+    )
+
+
+# --- Treemap（面積＝配下ファイル数のヒートマップ） ---------------------------
+# squarified treemap（Bruls et al.）。どのフォルダが重いか＝どこに削減余地が
+# あるかを一目で把握するための補助表現。純 SVG（CDN・JS 不要）。
+def _squarify(sizes: list[float], x: float, y: float, dx: float, dy: float) -> list[dict]:
+    """正規化済み面積 sizes（降順）を矩形リストに割り付ける。"""
+    if not sizes:
+        return []
+    if len(sizes) == 1:
+        return _layout(sizes, x, y, dx, dy)
+    i = 1
+    while i < len(sizes) and _worst(sizes[:i], dx, dy) >= _worst(sizes[: i + 1], dx, dy):
+        i += 1
+    current, remaining = sizes[:i], sizes[i:]
+    lx, ly, ldx, ldy = _leftover(current, x, y, dx, dy)
+    return _layout(current, x, y, dx, dy) + _squarify(remaining, lx, ly, ldx, ldy)
+
+
+def _layout(sizes, x, y, dx, dy):
+    covered = sum(sizes)
+    rects = []
+    if dx >= dy:
+        width = covered / dy if dy else 0
+        for s in sizes:
+            h = s / width if width else 0
+            rects.append({"x": x, "y": y, "dx": width, "dy": h})
+            y += h
+    else:
+        height = covered / dx if dx else 0
+        for s in sizes:
+            w = s / height if height else 0
+            rects.append({"x": x, "y": y, "dx": w, "dy": height})
+            x += w
+    return rects
+
+
+def _leftover(sizes, x, y, dx, dy):
+    covered = sum(sizes)
+    if dx >= dy:
+        width = covered / dy if dy else 0
+        return x + width, y, dx - width, dy
+    height = covered / dx if dx else 0
+    return x, y + height, dx, dy - height
+
+
+def _worst(sizes, dx, dy):
+    layout = _layout(sizes, 0, 0, dx, dy)
+    ratios = []
+    for r in layout:
+        w, h = r["dx"], r["dy"]
+        if w <= 0 or h <= 0:
+            return float("inf")
+        ratios.append(max(w / h, h / w))
+    return max(ratios) if ratios else float("inf")
+
+
+# 深さごとの塗り色（薄→濃）。ラベル高さと最小描画サイズの閾値。
+_TM_COLORS = ["#dbe4f0", "#c3d4ea", "#a9c1e0", "#8faed6"]
+_TM_LABEL_H = 16.0
+_TM_MIN = 26.0  # これより小さい矩形は子を描かない（潰れ防止）
+
+
+def _treemap_cells(node: dict, x, y, w, h, depth, max_depth, out: list) -> None:
+    children = node.get("children", [])
+    if not children or depth >= max_depth or w < _TM_MIN or h < _TM_MIN:
+        return
+    weighted = [(max(c.get("total", 0), 1), c) for c in children]
+    total = sum(wt for wt, _ in weighted)
+    if total <= 0:
+        return
+    area = w * h
+    norm = [(wt * area / total, c) for wt, c in weighted]
+    norm.sort(key=lambda t: t[0], reverse=True)
+    rects = _squarify([n for n, _ in norm], x, y, w, h)
+    for r, (_, child) in zip(rects, norm):
+        out.append((r["x"], r["y"], r["dx"], r["dy"], child, depth))
+        # ラベル分を上に空けて内側を再帰。
+        _treemap_cells(
+            child,
+            r["x"] + 1,
+            r["y"] + _TM_LABEL_H,
+            r["dx"] - 2,
+            r["dy"] - _TM_LABEL_H - 1,
+            depth + 1,
+            max_depth,
+            out,
+        )
+
+
+def _treemap_svg(node: dict, width: int = 1040, height: int = 460, max_depth: int = 2) -> str:
+    cells: list = []
+    _treemap_cells(node, 0, 0, float(width), float(height), 0, max_depth, cells)
+    if not cells:
+        return "<p>表示できるフォルダがありません。</p>"
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" '
+        f'preserveAspectRatio="xMidYMid meet" class="treemap" '
+        f'font-family="Segoe UI, Meiryo, sans-serif">'
+    ]
+    for rx, ry, rw, rh, child, depth in cells:
+        color = _TM_COLORS[min(depth, len(_TM_COLORS) - 1)]
+        name = _h(child.get("name", ""))
+        total = child.get("total", 0)
+        parts.append(
+            f'<rect x="{rx:.1f}" y="{ry:.1f}" width="{rw:.1f}" height="{rh:.1f}" '
+            f'fill="{color}" stroke="#fff" stroke-width="1.5" rx="2">'
+            f"<title>{name}｜配下{_h(total)}ファイル</title></rect>"
+        )
+        # 幅・高さに余裕がある時だけラベルを描く。
+        if rw > 46 and rh > 14:
+            parts.append(
+                f'<text x="{rx + 4:.1f}" y="{ry + 12:.1f}" font-size="11" '
+                f'fill="#1a2a44" clip-path="inset(0)">{name} ({_h(total)})</text>'
+            )
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def _summary_cards(summary: dict) -> str:
@@ -222,8 +364,11 @@ def _score_section(scan: ScanResult, analysis: AnalysisResult) -> str:
 
 
 def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
-    before = before_mermaid(scan)
-    after = after_mermaid(analysis.proposed_tree)
+    before_tree = before_tree_data(scan)
+    after_tree = after_tree_data(analysis.proposed_tree)
+    # 前後の Treemap は横並び比較のため、やや小さめの viewBox で描く。
+    before_treemap = _treemap_svg(before_tree, width=560, height=440)
+    after_treemap = _treemap_svg(after_tree, width=560, height=440)
     summary = analysis.summary
     llm_note = (
         "LLM補助（プロジェクト束ね）：有効"
@@ -251,8 +396,28 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
   .card .num {{ font-size:1.6rem; font-weight:700; color:#1f3a5f; }}
   .card .lbl {{ font-size:.8rem; color:#555; }}
   .diagrams {{ display:flex; flex-wrap:wrap; gap:16px; }}
-  .diagram {{ flex:1 1 460px; min-width:320px; background:#fafbfc;
-             border:1px solid #e2e5ea; border-radius:8px; padding:10px; overflow:auto; }}
+  .tree {{ flex:1 1 460px; min-width:320px; background:#fafbfc;
+          border:1px solid #e2e5ea; border-radius:8px; padding:10px; }}
+  .tree h3 {{ margin:.2rem 0 .4rem; font-size:.95rem; }}
+  .tree-tools {{ margin-bottom:6px; }}
+  .tree-tools button {{ font-size:.72rem; padding:2px 8px; margin-right:6px;
+          border:1px solid #c4ccd6; border-radius:5px; background:#eef2f8;
+          color:#1f3a5f; cursor:pointer; }}
+  .filetree, .filetree ul {{ list-style:none; margin:0; padding:0; }}
+  .filetree ul {{ margin-left:14px; border-left:1px dotted #c4ccd6; padding-left:10px; }}
+  .filetree li {{ font-size:.82rem; line-height:1.9; white-space:nowrap; }}
+  .filetree summary {{ cursor:pointer; }}
+  .filetree summary::marker {{ color:#1f5fa8; }}
+  .filetree .leaf {{ padding-left:14px; color:#333; }}
+  .filetree .tname {{ font-weight:600; color:#1f3a5f; }}
+  .filetree .b {{ display:inline-block; margin-left:6px; padding:0 6px; border-radius:9px;
+          font-size:.7rem; font-weight:600; }}
+  .filetree .b-file {{ background:#e3edf9; color:#1f5fa8; }}
+  .filetree .b-total {{ background:#eef1e6; color:#5c6b2f; }}
+  .filetree .cc {{ margin-left:6px; font-size:.7rem; color:#8a93a0; }}
+  .treemap-wrap {{ width:100%; overflow-x:auto; }}
+  .treemap {{ display:block; }}
+  .treemap text {{ pointer-events:none; }}
   table {{ border-collapse:collapse; width:100%; font-size:.85rem; }}
   th, td {{ border:1px solid #dfe3e8; padding:6px 8px; text-align:left;
            vertical-align:top; word-break:break-all; }}
@@ -263,7 +428,6 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
   .act-keep {{ color:#666; }}
   .act-check {{ color:#b02a37; font-weight:600; }}
   .scroll {{ max-height:520px; overflow:auto; }}
-  pre.mmsrc {{ white-space:pre-wrap; font-size:.75rem; background:#f0f0f0; padding:8px; }}
   details summary {{ cursor:pointer; font-size:.8rem; color:#1f5fa8; }}
   .note {{ font-size:.8rem; color:#666; }}
   .scorewrap {{ display:flex; align-items:center; justify-content:center; gap:24px;
@@ -304,9 +468,24 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
 
   <section>
     <h2>改善前後の構造（before / after）</h2>
+    <p class="note">大規模でも字が潰れないよう、折り畳みツリーで表示しています。
+       各行の <span class="b b-file">n</span> は直下ファイル数、
+       <span class="b b-total">Σn</span> は配下合計です。</p>
     <div class="diagrams">
-      {_mermaid_block("改善前（現状）", before)}
-      {_mermaid_block("改善後（提案）", after)}
+      {_tree_block("改善前（現状）", before_tree)}
+      {_tree_block("改善後（提案）", after_tree)}
+    </div>
+  </section>
+
+  <section>
+    <h2>容量ヒートマップ（配下ファイル数・上位2階層）</h2>
+    <p class="note">面積が大きいフォルダ＝ファイルが集中している場所です。
+       改善前後を並べると、集約・アーカイブ隔離で分散がどう解消されるかが分かります。</p>
+    <div class="diagrams">
+      <div class="tree"><h3>改善前（現状）</h3>
+        <div class="treemap-wrap">{before_treemap}</div></div>
+      <div class="tree"><h3>改善後（提案）</h3>
+        <div class="treemap-wrap">{after_treemap}</div></div>
     </div>
   </section>
 
@@ -332,11 +511,13 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
     <div class="scroll">{_move_plan_table(analysis)}</div>
   </section>
 </main>
-<script src="{_MERMAID_CDN}"></script>
 <script>
-  try {{
-    if (window.mermaid) {{ mermaid.initialize({{ startOnLoad: true, theme: 'neutral' }}); }}
-  }} catch (e) {{ console.warn('mermaid init failed', e); }}
+  // 折り畳みツリーの一括開閉。押されたボタンが属する .tree 内だけを対象にする。
+  function treeToggle(btn, open) {{
+    var root = btn.closest('.tree');
+    if (!root) return;
+    root.querySelectorAll('details').forEach(function (d) {{ d.open = open; }});
+  }}
 </script>
 </body></html>"""
 
@@ -351,11 +532,6 @@ def write_report(scan: ScanResult, analysis: AnalysisResult, out_dir: Path) -> d
     html_path.write_text(build_html(scan, analysis), encoding="utf-8")
     write_move_plan_csv(analysis, csv_path)
 
-    # mermaid 図を単体ファイルとしても出力（要件: mermaid 図として可視化）。
-    (out_dir / "before.mmd").write_text(before_mermaid(scan), encoding="utf-8")
-    (out_dir / "after.mmd").write_text(
-        after_mermaid(analysis.proposed_tree), encoding="utf-8"
-    )
     graph_path.write_text(
         json.dumps(
             {
@@ -371,6 +547,4 @@ def write_report(scan: ScanResult, analysis: AnalysisResult, out_dir: Path) -> d
         "report": str(html_path),
         "csv": str(csv_path),
         "graph": str(graph_path),
-        "before_mmd": str(out_dir / "before.mmd"),
-        "after_mmd": str(out_dir / "after.mmd"),
     }
