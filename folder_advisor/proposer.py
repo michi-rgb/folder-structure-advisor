@@ -1,10 +1,14 @@
 """改善後フォルダ構成の提案生成。
 
-方針：
-- 第一階層を「資料種別（category）」に統一し、散在を解消する。
-- 日付が名前から取れる場合は第二階層に「年度」を置く。
-- 完全重複は「正」1 本に統合し、冗長コピーは移動先を持たない（統合）。
-- 旧版（系列の最新以外）は各種別配下の `_アーカイブ(旧版)` に隔離提案する。
+方針（構造変更を最小化しつつ働き方改革の目的を達成する）:
+- **既存のフォルダ構造を土台に据え、既定はすべて「据置」**（現在地維持）。
+  第一階層を資料種別で作り直すような大改造はしない（ユーザーが慣れ直す負担を避ける）。
+- **散在の集約はプロジェクト単位**で行う。LLM が束ねたプロジェクトのメンバーが
+  複数フォルダに散らばっている場合のみ、最も多く集まっている**既存フォルダ**
+  （ホーム）へ寄せる提案を出す。ファイル種別では束ねない。
+- **完全重複**は「正」1 本へ統合（冗長コピーは移動先を持たない）。
+- **旧版**（系列の最新以外）は、そのプロジェクトのホーム（無ければ現在地）配下の
+  `_アーカイブ(旧版)` にローカル隔離する。
 - 実ファイルは動かさない。結果は移動計画（MovePlanItem）とネスト木で返す。
 """
 
@@ -14,6 +18,7 @@ import re
 from typing import Optional
 
 from .classifier import UNCLASSIFIED
+from .clustering import assign_projects, consolidation_target, resolve_home_folders
 from .filters import is_structural
 from .models import (
     AnalysisResult,
@@ -23,22 +28,8 @@ from .models import (
     ScanResult,
     VersionSeries,
 )
-from .versioning import normalize_name
 
 ARCHIVE_DIR = "_アーカイブ(旧版)"
-_DATE_IN_NAME = re.compile(r"(19|20)(\d{2})[-_]?\d{2}[-_]?\d{2}|\b(19|20)(\d{2})\b")
-
-
-def _fiscal_year(entry: FileEntry) -> Optional[str]:
-    """ファイル名から年（西暦）を推定する。更新日には依存しない。"""
-    m = _DATE_IN_NAME.search(entry.stem)
-    if not m:
-        return None
-    year = m.group(2) or m.group(4)
-    if year:
-        full = "20" + year if len(year) == 2 else year
-        return f"{full}年"
-    return None
 
 
 def _clean_segment(name: str) -> str:
@@ -47,17 +38,9 @@ def _clean_segment(name: str) -> str:
     return s or "未分類"
 
 
-def _proposed_path_for(entry: FileEntry, is_old_version: bool) -> str:
-    """1 ファイルの提案パスを組み立てる。"""
-    category = _clean_segment(entry.category or UNCLASSIFIED)
-    parts = [category]
-    if is_old_version:
-        parts.append(ARCHIVE_DIR)
-    year = _fiscal_year(entry)
-    if year:
-        parts.append(year)
-    parts.append(entry.name)
-    return "/".join(parts)
+def _join(parts: list[str]) -> str:
+    """空セグメントを除いて相対パスに連結する。"""
+    return "/".join(p for p in parts if p != "")
 
 
 def build_proposal(
@@ -65,10 +48,18 @@ def build_proposal(
     duplicate_groups: list[DuplicateGroup],
     version_series: list[VersionSeries],
     category_counts: dict[str, int],
-    naming_suggestion: Optional[dict] = None,
+    project_of: Optional[dict[str, str]] = None,
 ) -> AnalysisResult:
-    """分析結果から改善後ツリーと移動計画を生成する。"""
+    """分析結果から改善後ツリーと移動計画を生成する。
+
+    project_of は {相対パス: プロジェクトラベル}（LLM 由来が主、無ければ空）。
+    与えられた場合のみ、散在したプロジェクトのメンバーをホームフォルダへ集約する。
+    """
     by_path = {f.path: f for f in scan.files}
+
+    # プロジェクト割当（構成ファイル除外・不正ラベル除去）とホームフォルダ決定。
+    projects = assign_projects(scan.files, project_of)
+    home_of = resolve_home_folders(scan.files, projects)
 
     # 統合対象（冗長コピー）と旧版のパス集合を作る。
     redundant_paths: set[str] = set()
@@ -83,11 +74,31 @@ def build_proposal(
         for p in v.older:
             old_version_paths.add(p)
 
+    def base_folder_for(f: FileEntry) -> str:
+        """ファイルの提案上の所属フォルダ（既存フォルダ）を返す。
+
+        集約対象（一時/個人置き場にある散在メンバー）のみホームへ寄せ、それ以外は
+        現在の親のまま（＝据置）。判定は clustering.consolidation_target に委譲する。
+        """
+        target = consolidation_target(f, projects, home_of)
+        return target if target is not None else f.parent
+
+    def proposed_path_for(f: FileEntry, is_old: bool) -> str:
+        """1 ファイルの提案パスを組み立てる。"""
+        base = base_folder_for(f)
+        segments = [_clean_segment(s) for s in base.split("/") if s != ""]
+        if is_old:
+            segments.append(ARCHIVE_DIR)
+        segments.append(f.name)
+        return _join(segments)
+
     move_plan: list[MovePlanItem] = []
     # 提案ツリー構築に使う提案パス（統合で消える冗長コピーは含めない）。
     kept_proposed: list[str] = []
 
     for f in scan.files:
+        project = projects.get(f.path, "")
+
         # 構成ファイル（.gitignore / __init__.py 等）は移動せず据え置く。
         # 各フォルダに存在することに意味があり、集約するとプロジェクトが壊れるため。
         if is_structural(f.name):
@@ -98,6 +109,7 @@ def build_proposal(
                     category=f.category or UNCLASSIFIED,
                     action="据置",
                     reason="プロジェクト構成ファイル（各フォルダに存在して当然）のため据置",
+                    project=project,
                 )
             )
             kept_proposed.append(f.path)
@@ -109,7 +121,11 @@ def build_proposal(
         if is_redundant:
             # 完全重複の冗長コピーは「正」に統合（移動先は持たない）。
             primary = by_path.get(dup_primary_of[f.path])
-            primary_prop = _proposed_path_for(primary, primary.path in old_version_paths) if primary else "(正)"
+            primary_prop = (
+                proposed_path_for(primary, primary.path in old_version_paths)
+                if primary
+                else "(正)"
+            )
             move_plan.append(
                 MovePlanItem(
                     current_path=f.path,
@@ -117,22 +133,31 @@ def build_proposal(
                     category=f.category or UNCLASSIFIED,
                     action="統合",
                     reason=f"内容が完全一致する重複。正: {dup_primary_of[f.path]} に集約",
+                    project=project,
                     dup_flag=True,
                     old_version_flag=is_old,
                 )
             )
             continue
 
-        proposed = _proposed_path_for(f, is_old)
+        proposed = proposed_path_for(f, is_old)
         if is_old:
             action = "要確認"
-            reason = "旧版の可能性（系列の最新以外）。アーカイブへ隔離を提案"
+            home = base_folder_for(f) or "（ルート）"
+            reason = f"旧版の可能性（系列の最新以外）。{home} 配下の {ARCHIVE_DIR} へ隔離を提案"
         elif proposed == f.path:
             action = "据置"
-            reason = "既に適切な位置にあります"
+            if project:
+                reason = f"プロジェクト『{project}』の集約先に既に在るため据置"
+            else:
+                reason = "現状維持（構造変更なし）"
         else:
             action = "移動"
-            reason = f"資料種別『{f.category}』に集約"
+            home = base_folder_for(f) or "（ルート）"
+            reason = (
+                f"プロジェクト『{project}』のファイルが複数フォルダに散在。"
+                f"集約先 {home} に寄せる"
+            )
 
         move_plan.append(
             MovePlanItem(
@@ -141,6 +166,7 @@ def build_proposal(
                 category=f.category or UNCLASSIFIED,
                 action=action,
                 reason=reason,
+                project=project,
                 dup_flag=False,
                 old_version_flag=is_old,
             )
@@ -149,9 +175,6 @@ def build_proposal(
 
     proposed_tree = _build_tree(kept_proposed)
 
-    # 命名規約案（LLM が無ければ既定案）。
-    naming = naming_suggestion or _default_naming_suggestion()
-
     result = AnalysisResult(
         duplicate_groups=duplicate_groups,
         version_series=version_series,
@@ -159,20 +182,8 @@ def build_proposal(
         category_counts=dict(category_counts),
         proposed_tree=proposed_tree,
     )
-    result.summary = _summarize(scan, duplicate_groups, version_series, move_plan, naming)
+    result.summary = _summarize(scan, duplicate_groups, version_series, move_plan)
     return result
-
-
-def _default_naming_suggestion() -> dict:
-    return {
-        "naming_rule": "YYYYMMDD_案件名_資料名_版（例: 20240415_A社_見積書_v2）",
-        "folder_policy": "第一階層=資料種別、第二階層=年度（必要時）。旧版は各種別の _アーカイブ(旧版) に隔離。",
-        "examples": [
-            "20240415_定例_議事録",
-            "20240401_A社_見積書_v2",
-            "20240310_新製品_提案書_確定",
-        ],
-    }
 
 
 def _build_tree(paths: list[str]) -> dict:
@@ -190,12 +201,14 @@ def _build_tree(paths: list[str]) -> dict:
     return tree
 
 
-def _summarize(scan, dups, series, move_plan, naming) -> dict:
+def _summarize(scan, dups, series, move_plan) -> dict:
     from .duplicates import bytes_reclaimable
 
     action_counts: dict[str, int] = {}
     for m in move_plan:
         action_counts[m.action] = action_counts.get(m.action, 0) + 1
+
+    projects = {m.project for m in move_plan if m.project}
 
     return {
         "total_files": len(scan.files),
@@ -205,6 +218,6 @@ def _summarize(scan, dups, series, move_plan, naming) -> dict:
         "reclaimable_bytes": bytes_reclaimable(dups),
         "version_series": len(series),
         "old_versions": sum(len(v.older) for v in series),
+        "projects": len(projects),
         "actions": action_counts,
-        "naming_suggestion": naming,
     }

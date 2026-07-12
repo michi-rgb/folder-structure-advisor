@@ -140,6 +140,7 @@ class MovePlanItem:
     category: str
     action: str                         # 移動 / 統合 / 据置 / 要確認
     reason: str
+    project: str = ""                   # 束ねたプロジェクト/案件（クラスタ無しは空）
     dup_flag: bool = False
     old_version_flag: bool = False
 
