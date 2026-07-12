@@ -1,132 +1,130 @@
-"""before / after の可視化。
+"""before / after の可視化データ生成。
 
-- mermaid（flowchart TD）テキストを生成。大規模ツリーは深さ・子ノード数の上限で
-  「他 N 件」の集約ノードに折り畳み、mermaid が破綻しないようにする。
-- グラフ JSON（nodes / edges）も生成し、他ツール連携・再描画に使える形で出す。
+大規模なフォルダ構成では mermaid 図が巨大化して判読不能になるため廃止し、
+代わりに HTML 側で描画する 2 種類のデータを生成する。
+
+- **折り畳みツリー**：フォルダ／ファイルの親子ネスト木（名前・種別・サイズ・
+  ファイル数）。HTML の JS が展開／折り畳み可能なツリーとして描画する。
+- **Treemap（容量ヒートマップ）**：同じネスト木を面積＝容量で並べ、色の濃淡で
+  容量の大小を表す。どのフォルダ・ファイルが容量を食っているかを一目で掴む。
+
+グラフ JSON（nodes / edges）も従来どおり生成し、他ツール連携に使える形で出す。
 """
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
+from typing import Any, Optional
 
-from .models import ScanResult
-
-DEFAULT_MAX_DEPTH = 3
-DEFAULT_MAX_CHILDREN = 12
-# mermaid のフロー方向。LR=左から右、TD=上から下。
-DEFAULT_DIRECTION = "LR"
+from .models import AnalysisResult, ScanResult
 
 
-# --- mermaid 用のユーティリティ ---------------------------------------------
-def _mid(counter: list[int]) -> str:
-    counter[0] += 1
-    return f"n{counter[0]}"
+# --- 折り畳みツリー / Treemap 用のネスト木 ------------------------------------
+def _new_dir_node(name: str) -> dict[str, Any]:
+    """ディレクトリノードの器を作る。size は配下の総バイト、file_count は直下ファイル数。"""
+    return {"name": name, "type": "dir", "size": 0, "file_count": 0, "children": []}
 
 
-def _esc(label: str) -> str:
-    """mermaid ラベル内で問題になる文字を無害化する。"""
-    label = label.replace('"', "'").replace("\n", " ")
-    # 角括弧・波括弧はノード構文と衝突するため全角化。
-    label = label.replace("[", "［").replace("]", "］")
-    return label
+def _finalize(node: dict[str, Any]) -> dict[str, Any]:
+    """子を並べ替える（フォルダ→ファイル、各々サイズ降順）。"""
+    if node.get("type") != "dir":
+        return node
+    for child in node["children"]:
+        _finalize(child)
+    node["children"].sort(
+        key=lambda c: (0 if c["type"] == "dir" else 1, -c.get("size", 0), c["name"])
+    )
+    return node
 
 
-def _tree_from_dirs(scan: ScanResult) -> dict:
-    """走査結果（before）を親子ネスト辞書にする。値は子 dict、__files__ に件数。"""
-    children: dict[str, list[str]] = defaultdict(list)
-    file_counts: dict[str, int] = {}
-    names: dict[str, str] = {}
+def before_tree_data(scan: ScanResult) -> dict[str, Any]:
+    """走査結果（現状）を折り畳みツリー / Treemap 用のネスト木にする。"""
+    # 相対パス -> ディレクトリノード。ルートは "" をキーに持つ。
+    by_path: dict[str, dict[str, Any]] = {}
+    root_name = "（ルート）"
     for d in scan.dirs:
-        names[d.path] = d.name
-        file_counts[d.path] = d.file_count
-        if d.path != "":
-            children[d.parent].append(d.path)
-    return {"children": children, "file_counts": file_counts, "names": names}
+        by_path[d.path] = _new_dir_node(d.name or root_name)
+        if d.path == "":
+            root_name = d.name or root_name
+
+    root = by_path.get("")
+    if root is None:
+        root = _new_dir_node(root_name)
+        by_path[""] = root
+
+    # ディレクトリを親子で連結する。
+    for d in scan.dirs:
+        if d.path == "":
+            continue
+        parent = by_path.get(d.parent)
+        if parent is None:
+            parent = root
+        parent["children"].append(by_path[d.path])
+
+    # ファイルを親フォルダに載せ、サイズを祖先へ加算する。
+    for f in scan.files:
+        parent = by_path.get(f.parent) or root
+        parent["children"].append({"name": f.name, "type": "file", "size": f.size})
+        parent["file_count"] += 1
+        _add_size_up(by_path, f.parent, f.size)
+
+    return _finalize(root)
 
 
-def before_mermaid(
-    scan: ScanResult,
-    max_depth: int = DEFAULT_MAX_DEPTH,
-    max_children: int = DEFAULT_MAX_CHILDREN,
-    direction: str = DEFAULT_DIRECTION,
-) -> str:
-    """走査結果（現状）を mermaid flowchart にする。"""
-    info = _tree_from_dirs(scan)
-    children = info["children"]
-    file_counts = info["file_counts"]
-    names = info["names"]
-    counter = [0]
-    lines = [f"flowchart {direction}"]
-
-    def emit(path: str, depth: int) -> str:
-        nid = _mid(counter)
-        label = names.get(path, path) or "（ルート）"
-        fc = file_counts.get(path, 0)
-        suffix = f"<br/>{fc}ファイル" if fc else ""
-        lines.append(f'    {nid}["{_esc(label)}{suffix}"]')
-        if depth >= max_depth:
-            subdirs = children.get(path, [])
-            if subdirs:
-                cid = _mid(counter)
-                lines.append(f'    {cid}["... 他 {len(subdirs)} フォルダ"]')
-                lines.append(f"    {nid} --> {cid}")
-            return nid
-        kids = children.get(path, [])
-        for child in kids[:max_children]:
-            child_id = emit(child, depth + 1)
-            lines.append(f"    {nid} --> {child_id}")
-        if len(kids) > max_children:
-            cid = _mid(counter)
-            lines.append(f'    {cid}["... 他 {len(kids) - max_children} フォルダ"]')
-            lines.append(f"    {nid} --> {cid}")
-        return nid
-
-    emit("", 0)
-    return "\n".join(lines)
+def _add_size_up(by_path: dict[str, dict[str, Any]], start: str, size: int) -> None:
+    """start フォルダから祖先まで size を加算する（区切りは "/"）。"""
+    path = start
+    while True:
+        node = by_path.get(path)
+        if node is not None:
+            node["size"] += size
+        if path == "":
+            break
+        idx = path.rfind("/")
+        path = path[:idx] if idx >= 0 else ""
 
 
-def after_mermaid(
-    proposed_tree: dict,
-    max_depth: int = DEFAULT_MAX_DEPTH,
-    max_children: int = DEFAULT_MAX_CHILDREN,
-    direction: str = DEFAULT_DIRECTION,
-) -> str:
-    """提案ツリー（ネスト辞書）を mermaid flowchart にする。"""
-    counter = [0]
-    lines = [f"flowchart {direction}"]
-    root_id = _mid(counter)
-    lines.append(f'    {root_id}["（改善後ルート）"]')
+def after_tree_data(scan: ScanResult, analysis: AnalysisResult) -> dict[str, Any]:
+    """提案（改善後）を折り畳みツリー / Treemap 用のネスト木にする。
 
-    def emit(node: dict, parent_id: str, depth: int) -> None:
-        subdirs = [(k, v) for k, v in node.items() if k != "__files__"]
-        files = node.get("__files__", [])
-        if depth >= max_depth:
-            total = len(subdirs)
-            if total:
-                cid = _mid(counter)
-                lines.append(f'    {cid}["... 他 {total} フォルダ"]')
-                lines.append(f"    {parent_id} --> {cid}")
-            return
-        for name, child in subdirs[:max_children]:
-            nid = _mid(counter)
-            fc = len(child.get("__files__", []))
-            suffix = f"<br/>{fc}ファイル" if fc else ""
-            lines.append(f'    {nid}["{_esc(name)}{suffix}"]')
-            lines.append(f"    {parent_id} --> {nid}")
-            emit(child, nid, depth + 1)
-        if len(subdirs) > max_children:
-            cid = _mid(counter)
-            lines.append(f'    {cid}["... 他 {len(subdirs) - max_children} フォルダ"]')
-            lines.append(f"    {parent_id} --> {cid}")
-        # ルート直下ファイルがある場合のみ件数表示。
-        if files and depth == 0:
-            fid = _mid(counter)
-            lines.append(f'    {fid}["直下 {len(files)} ファイル"]')
-            lines.append(f"    {parent_id} --> {fid}")
+    移動計画の提案パスにファイルを配置する。統合（冗長コピー）は正へ集約されて
+    消えるためツリーには含めない（＝容量削減が Treemap の面積にも反映される）。
+    サイズは元ファイル（current_path）の実バイト数を用いる。
+    """
+    size_of = {f.path: f.size for f in scan.files}
+    root = _new_dir_node("（改善後ルート）")
+    dir_index: dict[str, dict[str, Any]] = {"": root}
 
-    emit(proposed_tree, root_id, 0)
-    return "\n".join(lines)
+    for m in analysis.move_plan:
+        if m.action == "統合":
+            continue  # 冗長コピーは正へ集約され消える
+        size = size_of.get(m.current_path, 0)
+        parts = [p for p in m.proposed_path.split("/") if p != ""]
+        if not parts:
+            continue
+        *dir_parts, file_name = parts
+        parent = root
+        acc = ""
+        for seg in dir_parts:
+            acc = f"{acc}/{seg}" if acc else seg
+            child = dir_index.get(acc)
+            if child is None:
+                child = _new_dir_node(seg)
+                parent["children"].append(child)
+                dir_index[acc] = child
+            parent = child
+        parent["children"].append({"name": file_name, "type": "file", "size": size})
+        parent["file_count"] += 1
+        # サイズを祖先へ加算する。
+        acc = ""
+        chain = [root]
+        for seg in dir_parts:
+            acc = f"{acc}/{seg}" if acc else seg
+            chain.append(dir_index[acc])
+        for node in chain:
+            node["size"] += size
+
+    return _finalize(root)
 
 
 # --- グラフ JSON -------------------------------------------------------------

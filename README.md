@@ -4,8 +4,9 @@
 整頓する改善案を提案**する CLI ツールです。第一階層を資料種別で作り直すような大改造は
 せず、**既定はすべて据置**。散在は**プロジェクト/案件単位**（ファイル名の類似性＋既存
 フォルダ文脈を LLM が判断）で最小限だけ集約します。実ファイルは一切変更せず
-（提案・可視化のみ）、before/after を **mermaid 図**とグラフ JSON で可視化した
-**HTML レポート**と、**移動計画 CSV** を出力します。
+（提案・可視化のみ）、before/after を **折り畳みツリー**と **Treemap（容量ヒート
+マップ）** で可視化した **HTML レポート**（外部 CDN 不要・オフライン表示可）と、
+**移動計画 CSV** を出力します。
 
 > 背景・課題整理は [`docs/設計計画.md`](docs/設計計画.md) を参照。
 
@@ -97,15 +98,17 @@ python -m folder_advisor run --source sample_data --out out --llm --llm-provider
 
 | ファイル | 内容 |
 |---|---|
-| `report.html`   | 整理健全度スコア・before/after 図・重複表・旧版表・分類・移動計画 |
+| `report.html`   | 整理健全度スコア・before/after の折り畳みツリー / Treemap・重複表・旧版表・分類・移動計画 |
 | `move_plan.csv` | 全ファイルの `現在パス→提案パス→分類→アクション→根拠`（Excel 対応 BOM 付き） |
-| `before.mmd` / `after.mmd` | 改善前後の mermaid 図ソース（[mermaid.live](https://mermaid.live) 等に貼付可） |
 | `graph.json`    | before/after の nodes/edges グラフデータ |
 | `scan.json` / `analysis.json` | 走査生データ・分析結果（再利用・監査用） |
 
-> HTML の図はブラウザで mermaid.js（CDN）を読み込んで描画します。社内ネットワークで
-> CDN が使えない場合は、各図の「mermaid ソース」折り畳み、または `*.mmd` を
-> [mermaid.live](https://mermaid.live) に貼り付けて確認してください。
+> **before/after の構造可視化**は、大規模フォルダで巨大化して判読できなくなる
+> mermaid 図を廃止し、レポート内蔵の JS（**外部 CDN 不要**）で描画する 2 種類に
+> 置き換えました。**折り畳みツリー**でフォルダを開閉しながら構造を辿れ、
+> **Treemap（容量ヒートマップ）** では面積＝容量・色が濃いほど大容量で、どこが
+> 容量を食っているか／整理でどう変わるかを俯瞰できます（フォルダをクリックで
+> 掘り下げ可能）。社内ネットワークでもオフラインで表示できます。
 
 ## 移動計画のアクション区分
 
@@ -139,7 +142,7 @@ folder_advisor/
   clustering.py  プロジェクト束ね＋集約先（ホーム）決定＋一時/個人置き場の限定集約
   proposer.py    据置既定・散在集約の移動計画・改善後ツリー
   scoring.py     整理健全度スコア（改善前後・100点満点）の算出
-  visualize.py   before/after mermaid・グラフ JSON
+  visualize.py   before/after の折り畳みツリー・Treemap 用データ・グラフ JSON
   report.py      HTML レポート・CSV 出力
   cli.py         コマンドライン
 ```
