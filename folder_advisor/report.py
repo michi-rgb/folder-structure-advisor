@@ -1,8 +1,14 @@
 """HTML レポート生成と移動計画 CSV 出力。
 
-レポートは 1 ファイルで完結する HTML。mermaid 図はブラウザで描画するため
-mermaid.js を CDN から読み込むが、読み込めない環境（社内ネットワーク等）でも
-図のソースを折り畳みで確認できるようフォールバックを用意する。
+レポートは 1 ファイルで完結する HTML。before/after のフォルダ構成は、巨大化して
+判読困難になる mermaid 図を廃止し、外部 CDN に依存しない自前の描画に置き換えた
+（社内ネットワークでもオフラインで表示できる）。改善前後それぞれについて、
+
+- **折り畳みツリー**：フォルダを開閉しながら構造を辿れるツリー
+- **Treemap（容量ヒートマップ）**：面積＝容量・色の濃淡＝容量の大小で、どこが
+  容量を食っているか／整理でどう変わるかを俯瞰
+
+をブラウザ内蔵の JS（外部依存なし）で描画する。
 """
 
 from __future__ import annotations
@@ -16,12 +22,249 @@ from .models import AnalysisResult, ScanResult
 from .scoring import score_structure
 from .visualize import (
     after_graph_json,
-    after_mermaid,
+    after_tree_data,
     before_graph_json,
-    before_mermaid,
+    before_tree_data,
 )
 
-_MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+# 外部 CDN に依存しない、before/after 用の折り畳みツリー＋Treemap 描画スクリプト。
+# f-string ではなく素の文字列として保持し、波括弧のエスケープを避ける。
+_VIZ_JS = r"""
+(function () {
+  var DATA = window.__VIZ__ || {};
+
+  function fmtBytes(n) {
+    n = n || 0;
+    var u = ["B", "KB", "MB", "GB", "TB"], i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? n : v.toFixed(1)) + u[i];
+  }
+
+  // 配下の総ファイル数を前計算してノードに付与する。
+  function decorate(node) {
+    if (node.type !== "dir") { node._tf = 1; return 1; }
+    var t = 0, ch = node.children || [];
+    for (var i = 0; i < ch.length; i++) t += decorate(ch[i]);
+    node._tf = t;
+    return t;
+  }
+
+  // --- 折り畳みツリー --------------------------------------------------------
+  function buildNode(node, depth) {
+    var el = document.createElement("div");
+    el.className = "tnode";
+    var isDir = node.type === "dir";
+    var hasKids = isDir && node.children && node.children.length;
+    var row = document.createElement("div");
+    row.className = "trow " + (isDir ? "dir" : "file");
+
+    var caret = document.createElement("span");
+    caret.className = "tcaret";
+    caret.textContent = hasKids ? "▾" : "";
+    var icon = document.createElement("span");
+    icon.className = "ticon";
+    icon.textContent = isDir ? "📁" : "📄";
+    var name = document.createElement("span");
+    name.className = "tname";
+    name.textContent = node.name;
+    var meta = document.createElement("span");
+    meta.className = "tmeta";
+    meta.textContent = isDir
+      ? "  " + node._tf + " ファイル・" + fmtBytes(node.size)
+      : "  " + fmtBytes(node.size);
+
+    row.appendChild(caret);
+    row.appendChild(icon);
+    row.appendChild(name);
+    row.appendChild(meta);
+    el.appendChild(row);
+
+    if (hasKids) {
+      var kids = document.createElement("div");
+      kids.className = "tchildren";
+      node.children.forEach(function (c) { kids.appendChild(buildNode(c, depth + 1)); });
+      el.appendChild(kids);
+      row.addEventListener("click", function () { el.classList.toggle("collapsed"); });
+      if (depth >= 1) el.classList.add("collapsed"); // 既定はルート直下のみ展開
+    }
+    return el;
+  }
+
+  function renderTree(pane, root) {
+    var ctl = document.createElement("div");
+    ctl.className = "tctl";
+    var bAll = document.createElement("button");
+    bAll.textContent = "すべて展開";
+    var bNone = document.createElement("button");
+    bNone.textContent = "すべて折りたたむ";
+    ctl.appendChild(bAll);
+    ctl.appendChild(bNone);
+    pane.appendChild(ctl);
+
+    var treeEl = buildNode(root, 0);
+    pane.appendChild(treeEl);
+
+    bAll.addEventListener("click", function () {
+      pane.querySelectorAll(".tnode.collapsed").forEach(function (n) { n.classList.remove("collapsed"); });
+    });
+    bNone.addEventListener("click", function () {
+      pane.querySelectorAll(".tnode").forEach(function (n, i) {
+        if (n !== treeEl && n.querySelector(".tchildren")) n.classList.add("collapsed");
+      });
+    });
+  }
+
+  // --- Treemap（容量ヒートマップ） ------------------------------------------
+  // 面積を二分割していく素朴な squarified 近似。外部ライブラリ不要で見やすい。
+  function layout(items, rect, out) {
+    if (items.length === 0) return;
+    if (items.length === 1) { out.push({ node: items[0].node, rect: rect }); return; }
+    var total = 0, i;
+    for (i = 0; i < items.length; i++) total += items[i].area;
+    var acc = 0, split = 0;
+    for (i = 0; i < items.length; i++) {
+      if (i > 0 && acc + items[i].area > total / 2) break;
+      acc += items[i].area; split = i + 1;
+    }
+    var g1 = items.slice(0, split), g2 = items.slice(split);
+    var f = acc / total;
+    if (rect.w >= rect.h) {
+      var wl = rect.w * f;
+      layout(g1, { x: rect.x, y: rect.y, w: wl, h: rect.h }, out);
+      layout(g2, { x: rect.x + wl, y: rect.y, w: rect.w - wl, h: rect.h }, out);
+    } else {
+      var ht = rect.h * f;
+      layout(g1, { x: rect.x, y: rect.y, w: rect.w, h: ht }, out);
+      layout(g2, { x: rect.x, y: rect.y + ht, w: rect.w, h: rect.h - ht }, out);
+    }
+  }
+
+  function heat(t) { // t:0..1 -> 薄い青→濃い紺
+    t = Math.max(0, Math.min(1, t));
+    var a = [230, 238, 247], b = [31, 58, 95];
+    var r = Math.round(a[0] + (b[0] - a[0]) * t);
+    var g = Math.round(a[1] + (b[1] - a[1]) * t);
+    var bl = Math.round(a[2] + (b[2] - a[2]) * t);
+    return "rgb(" + r + "," + g + "," + bl + ")";
+  }
+
+  function renderTreemap(pane, rootRoot) {
+    pane.innerHTML = "";
+    var crumb = document.createElement("div");
+    crumb.className = "tmcrumb";
+    var wrap = document.createElement("div");
+    wrap.className = "tmwrap";
+    pane.appendChild(crumb);
+    pane.appendChild(wrap);
+
+    var stack = [rootRoot]; // ドリルダウン用スタック
+
+    function draw() {
+      var current = stack[stack.length - 1];
+      // パンくず
+      crumb.innerHTML = "";
+      stack.forEach(function (n, idx) {
+        if (idx > 0) crumb.appendChild(document.createTextNode(" / "));
+        if (idx < stack.length - 1) {
+          var a = document.createElement("a");
+          a.textContent = n.name;
+          a.addEventListener("click", function () { stack = stack.slice(0, idx + 1); draw(); });
+          crumb.appendChild(a);
+        } else {
+          crumb.appendChild(document.createTextNode(n.name));
+        }
+      });
+
+      wrap.innerHTML = "";
+      var W = wrap.clientWidth || 400, H = wrap.clientHeight || 420;
+      var kids = (current.children || []).filter(function (c) { return (c.size || 0) > 0; });
+      if (kids.length === 0) {
+        var e = document.createElement("div");
+        e.className = "tmempty";
+        e.textContent = "容量情報のある項目がありません。";
+        wrap.appendChild(e);
+        return;
+      }
+      var maxSize = 0;
+      kids.forEach(function (c) { if (c.size > maxSize) maxSize = c.size; });
+      var totalSize = 0;
+      kids.forEach(function (c) { totalSize += c.size; });
+      var area = W * H;
+      var items = kids.slice().sort(function (a, b) { return b.size - a.size; })
+        .map(function (c) { return { node: c, area: c.size / totalSize * area }; });
+
+      var cells = [];
+      layout(items, { x: 0, y: 0, w: W, h: H }, cells);
+
+      cells.forEach(function (c) {
+        var node = c.node, r = c.rect;
+        var div = document.createElement("div");
+        var isDir = node.type === "dir";
+        div.className = "tmcell" + (isDir ? " dir" : "");
+        div.style.left = r.x + "px";
+        div.style.top = r.y + "px";
+        div.style.width = Math.max(0, r.w) + "px";
+        div.style.height = Math.max(0, r.h) + "px";
+        div.style.background = heat(maxSize ? node.size / maxSize : 0);
+        var deep = isDir ? node._tf + " ファイル" : "ファイル";
+        div.title = node.name + "\n" + fmtBytes(node.size) + "（" + deep + "）";
+        if (r.w > 42 && r.h > 18) {
+          var lab = document.createElement("div");
+          lab.className = "tmlabel";
+          lab.style.color = (maxSize && node.size / maxSize > 0.55) ? "#f5f8fc" : "#12233b";
+          lab.textContent = (isDir ? "📁 " : "") + node.name + " · " + fmtBytes(node.size);
+          div.appendChild(lab);
+        }
+        if (isDir && (node.children || []).some(function (x) { return (x.size || 0) > 0; })) {
+          div.addEventListener("click", function () { stack.push(node); draw(); });
+        }
+        wrap.appendChild(div);
+      });
+    }
+
+    pane._tmDraw = draw; // タブ表示時／リサイズ時に呼ぶ
+    draw();
+  }
+
+  // --- 組み立て --------------------------------------------------------------
+  ["before", "after"].forEach(function (side) {
+    var root = DATA[side];
+    if (!root) return;
+    decorate(root);
+    var treePane = document.querySelector('.vizpane.tree[data-side="' + side + '"]');
+    var tmPane = document.querySelector('.vizpane.treemap[data-side="' + side + '"]');
+    if (treePane) renderTree(treePane, root);
+    if (tmPane) renderTreemap(tmPane, root);
+  });
+
+  // タブ切替。Treemap は表示された瞬間にサイズが確定するため再描画する。
+  document.querySelectorAll(".viztabs").forEach(function (tabs) {
+    var side = tabs.getAttribute("data-side");
+    tabs.querySelectorAll(".vtab").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var view = btn.getAttribute("data-view");
+        tabs.querySelectorAll(".vtab").forEach(function (b) { b.classList.remove("active"); });
+        btn.classList.add("active");
+        document.querySelectorAll('.vizpane[data-side="' + side + '"]').forEach(function (p) {
+          var show = p.getAttribute("data-view") === view;
+          p.hidden = !show;
+          if (show && p._tmDraw) p._tmDraw();
+        });
+      });
+    });
+  });
+
+  var rzTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(rzTimer);
+    rzTimer = setTimeout(function () {
+      document.querySelectorAll(".vizpane.treemap").forEach(function (p) {
+        if (!p.hidden && p._tmDraw) p._tmDraw();
+      });
+    }, 200);
+  });
+})();
+"""
 
 
 def _h(text) -> str:
@@ -59,15 +302,17 @@ def write_move_plan_csv(analysis: AnalysisResult, out_path: Path) -> None:
             )
 
 
-def _mermaid_block(title: str, code: str) -> str:
-    esc_code = _h(code)
+def _viz_block(title: str, side: str) -> str:
+    """1 側（before / after）分のツリー＋Treemap の器。中身は JS が描画する。"""
     return f"""
       <div class="diagram">
         <h3>{_h(title)}</h3>
-        <div class="mermaid">{esc_code}</div>
-        <details><summary>mermaid ソース（コピー用・図が表示されない場合）</summary>
-          <pre class="mmsrc">{esc_code}</pre>
-        </details>
+        <div class="viztabs" data-side="{side}">
+          <button class="vtab active" data-view="tree">折り畳みツリー</button>
+          <button class="vtab" data-view="treemap">Treemap（容量ヒートマップ）</button>
+        </div>
+        <div class="vizpane tree" data-side="{side}" data-view="tree"></div>
+        <div class="vizpane treemap" data-side="{side}" data-view="treemap" hidden></div>
       </div>"""
 
 
@@ -222,8 +467,16 @@ def _score_section(scan: ScanResult, analysis: AnalysisResult) -> str:
 
 
 def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
-    before = before_mermaid(scan)
-    after = after_mermaid(analysis.proposed_tree)
+    viz_data = json.dumps(
+        {
+            "before": before_tree_data(scan),
+            "after": after_tree_data(scan, analysis),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    # </script> がデータ中に現れると script 要素が閉じてしまうため無害化する。
+    viz_data = viz_data.replace("</", "<\\/")
     summary = analysis.summary
     llm_note = (
         "LLM補助（プロジェクト束ね）：有効"
@@ -252,7 +505,47 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
   .card .lbl {{ font-size:.8rem; color:#555; }}
   .diagrams {{ display:flex; flex-wrap:wrap; gap:16px; }}
   .diagram {{ flex:1 1 460px; min-width:320px; background:#fafbfc;
-             border:1px solid #e2e5ea; border-radius:8px; padding:10px; overflow:auto; }}
+             border:1px solid #e2e5ea; border-radius:8px; padding:10px; }}
+  .diagram h3 {{ margin:.2rem 0 .6rem; font-size:1rem; }}
+  .viztabs {{ display:flex; gap:6px; margin-bottom:8px; }}
+  .vtab {{ font:inherit; font-size:.78rem; padding:5px 10px; cursor:pointer;
+          border:1px solid #cdd4de; background:#eef2f8; color:#33415c;
+          border-radius:6px; }}
+  .vtab.active {{ background:#1f3a5f; color:#fff; border-color:#1f3a5f; }}
+  .vizpane {{ overflow:auto; }}
+  .vizpane.tree {{ max-height:520px; font-size:.82rem; }}
+  /* 折り畳みツリー */
+  .tnode {{ user-select:none; }}
+  .trow {{ display:flex; align-items:center; gap:6px; padding:2px 4px;
+          border-radius:5px; white-space:nowrap; }}
+  .trow:hover {{ background:#eef2f8; }}
+  .trow.dir {{ cursor:pointer; }}
+  .tcaret {{ display:inline-block; width:1em; text-align:center; color:#7a869a;
+            transition:transform .12s; }}
+  .tnode.collapsed > .trow .tcaret {{ transform:rotate(-90deg); }}
+  .tnode.collapsed > .tchildren {{ display:none; }}
+  .ticon {{ width:1.1em; text-align:center; }}
+  .tname {{ font-weight:600; color:#1f3a5f; }}
+  .trow.file .tname {{ font-weight:400; color:#33415c; }}
+  .tmeta {{ color:#7a869a; font-size:.74rem; }}
+  .tchildren {{ margin-left:1.05em; border-left:1px dotted #d3d9e2; padding-left:.5em; }}
+  .tctl {{ display:flex; gap:10px; margin-bottom:6px; }}
+  .tctl button {{ font:inherit; font-size:.72rem; color:#1f5fa8; background:none;
+                 border:none; cursor:pointer; padding:0; text-decoration:underline; }}
+  /* Treemap */
+  .tmwrap {{ position:relative; width:100%; height:420px; }}
+  .tmcrumb {{ font-size:.75rem; margin-bottom:6px; color:#33415c; min-height:1.2em; }}
+  .tmcrumb a {{ color:#1f5fa8; cursor:pointer; text-decoration:underline; }}
+  .tmcell {{ position:absolute; box-sizing:border-box; border:1px solid rgba(255,255,255,.7);
+            overflow:hidden; cursor:default; }}
+  .tmcell.dir {{ cursor:pointer; }}
+  .tmcell .tmlabel {{ font-size:.7rem; line-height:1.15; padding:2px 4px;
+                     color:#12233b; pointer-events:none; }}
+  .tmempty {{ color:#7a869a; font-size:.8rem; padding:12px; }}
+  .tmlegend {{ display:flex; align-items:center; gap:8px; margin-top:12px;
+              font-size:.75rem; color:#666; }}
+  .tmbar {{ display:inline-block; width:160px; height:12px; border-radius:6px;
+           background:linear-gradient(90deg,#e6eef7,#7fa8d6,#1f3a5f); }}
   table {{ border-collapse:collapse; width:100%; font-size:.85rem; }}
   th, td {{ border:1px solid #dfe3e8; padding:6px 8px; text-align:left;
            vertical-align:top; word-break:break-all; }}
@@ -263,7 +556,6 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
   .act-keep {{ color:#666; }}
   .act-check {{ color:#b02a37; font-weight:600; }}
   .scroll {{ max-height:520px; overflow:auto; }}
-  pre.mmsrc {{ white-space:pre-wrap; font-size:.75rem; background:#f0f0f0; padding:8px; }}
   details summary {{ cursor:pointer; font-size:.8rem; color:#1f5fa8; }}
   .note {{ font-size:.8rem; color:#666; }}
   .scorewrap {{ display:flex; align-items:center; justify-content:center; gap:24px;
@@ -304,9 +596,17 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
 
   <section>
     <h2>改善前後の構造（before / after）</h2>
+    <p class="note">各図は「折り畳みツリー」と「Treemap（容量ヒートマップ）」を切替できます。
+       Treemap は面積＝容量・色が濃いほど大容量。フォルダをクリックすると
+       その配下だけを掘り下げられます。</p>
     <div class="diagrams">
-      {_mermaid_block("改善前（現状）", before)}
-      {_mermaid_block("改善後（提案）", after)}
+      {_viz_block("改善前（現状）", "before")}
+      {_viz_block("改善後（提案）", "after")}
+    </div>
+    <div class="tmlegend">
+      <span>容量：小</span>
+      <span class="tmbar"></span>
+      <span>大</span>
     </div>
   </section>
 
@@ -332,12 +632,8 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
     <div class="scroll">{_move_plan_table(analysis)}</div>
   </section>
 </main>
-<script src="{_MERMAID_CDN}"></script>
-<script>
-  try {{
-    if (window.mermaid) {{ mermaid.initialize({{ startOnLoad: true, theme: 'neutral' }}); }}
-  }} catch (e) {{ console.warn('mermaid init failed', e); }}
-</script>
+<script>window.__VIZ__ = {viz_data};</script>
+<script>{_VIZ_JS}</script>
 </body></html>"""
 
 
@@ -351,11 +647,6 @@ def write_report(scan: ScanResult, analysis: AnalysisResult, out_dir: Path) -> d
     html_path.write_text(build_html(scan, analysis), encoding="utf-8")
     write_move_plan_csv(analysis, csv_path)
 
-    # mermaid 図を単体ファイルとしても出力（要件: mermaid 図として可視化）。
-    (out_dir / "before.mmd").write_text(before_mermaid(scan), encoding="utf-8")
-    (out_dir / "after.mmd").write_text(
-        after_mermaid(analysis.proposed_tree), encoding="utf-8"
-    )
     graph_path.write_text(
         json.dumps(
             {
@@ -371,6 +662,4 @@ def write_report(scan: ScanResult, analysis: AnalysisResult, out_dir: Path) -> d
         "report": str(html_path),
         "csv": str(csv_path),
         "graph": str(graph_path),
-        "before_mmd": str(out_dir / "before.mmd"),
-        "after_mmd": str(out_dir / "after.mmd"),
     }
