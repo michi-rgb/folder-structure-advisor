@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from .models import AnalysisResult, ScanResult
+from .scoring import score_structure
 from .visualize import (
     after_graph_json,
     after_mermaid,
@@ -41,13 +42,14 @@ def write_move_plan_csv(analysis: AnalysisResult, out_path: Path) -> None:
     with out_path.open("w", encoding="utf-8-sig", newline="") as fp:
         writer = csv.writer(fp)
         writer.writerow(
-            ["現在パス", "提案パス", "分類", "アクション", "重複", "旧版", "根拠"]
+            ["現在パス", "提案パス", "プロジェクト", "分類", "アクション", "重複", "旧版", "根拠"]
         )
         for m in analysis.move_plan:
             writer.writerow(
                 [
                     m.current_path,
                     m.proposed_path,
+                    m.project,
                     m.category,
                     m.action,
                     "○" if m.dup_flag else "",
@@ -77,6 +79,7 @@ def _summary_cards(summary: dict) -> str:
         ("冗長コピー", summary.get("redundant_copies", 0)),
         ("削減見込み", _fmt_bytes(summary.get("reclaimable_bytes", 0))),
         ("旧版の可能性", summary.get("old_versions", 0)),
+        ("プロジェクト", summary.get("projects", 0)),
     ]
     items = "".join(
         f'<div class="card"><div class="num">{_h(v)}</div>'
@@ -144,28 +147,78 @@ def _move_plan_table(analysis: AnalysisResult, limit: int = 500) -> str:
         }.get(m.action, "")
         rows.append(
             f"<tr><td>{_h(m.current_path)}</td><td>{_h(m.proposed_path)}</td>"
-            f"<td>{_h(m.category)}</td><td class='{cls}'>{_h(m.action)}</td>"
+            f"<td>{_h(m.project)}</td><td>{_h(m.category)}</td>"
+            f"<td class='{cls}'>{_h(m.action)}</td>"
             f"<td>{_h(m.reason)}</td></tr>"
         )
     note = ""
     if len(analysis.move_plan) > limit:
         note = f"<p>※ 表示は先頭 {limit} 件。全件は move_plan.csv を参照。</p>"
     return (
-        "<table><thead><tr><th>現在パス</th><th>提案パス</th><th>分類</th>"
-        "<th>アクション</th><th>根拠</th></tr></thead>"
+        "<table><thead><tr><th>現在パス</th><th>提案パス</th><th>プロジェクト</th>"
+        "<th>分類</th><th>アクション</th><th>根拠</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>{note}"
     )
 
 
-def _naming_block(summary: dict) -> str:
-    ns = summary.get("naming_suggestion") or {}
-    if not ns:
-        return ""
-    examples = "".join(f"<li>{_h(e)}</li>" for e in ns.get("examples", []))
-    return f"""
-      <p><b>命名規約案：</b>{_h(ns.get('naming_rule', ''))}</p>
-      <p><b>フォルダ体系方針：</b>{_h(ns.get('folder_policy', ''))}</p>
-      {'<ul>' + examples + '</ul>' if examples else ''}"""
+def _score_color(score: int) -> str:
+    if score >= 75:
+        return "#0a7d33"
+    if score >= 60:
+        return "#b5651d"
+    return "#b02a37"
+
+
+def _score_section(scan: ScanResult, analysis: AnalysisResult) -> str:
+    """整理健全度スコア（改善前→改善後・100点満点）のブロックを組み立てる。"""
+    sc = score_structure(scan, analysis)
+    b, a = sc["before_total"], sc["after_total"]
+    delta = sc["delta"]
+    bcol, acol = _score_color(b), _score_color(a)
+
+    # 大きな before → after 表示。
+    big = f"""
+      <div class="scorewrap">
+        <div class="scorebox">
+          <div class="scorecap">改善前</div>
+          <div class="scoreval" style="color:{bcol}">{b}<span class="max">/100</span></div>
+          <div class="scoregrade">{_h(sc['grade_before'])}</div>
+        </div>
+        <div class="scorearrow">→<div class="scoredelta">+{delta}</div></div>
+        <div class="scorebox">
+          <div class="scorecap">改善後</div>
+          <div class="scoreval" style="color:{acol}">{a}<span class="max">/100</span></div>
+          <div class="scoregrade">{_h(sc['grade_after'])}</div>
+        </div>
+      </div>"""
+
+    # 観点別の内訳（重み・before・after・バー）。
+    rows = []
+    for d in sc["dimensions"]:
+        rows.append(
+            f"<tr><td>{_h(d['label'])}<br><span class='dimdetail'>"
+            f"{_h(d['before_detail'])} → {_h(d['after_detail'])}</span></td>"
+            f"<td class='num'>{_h(d['weight'])}%</td>"
+            f"<td class='num'>{_h(d['before'])}</td>"
+            f"<td class='num'><b style='color:{_score_color(d['after'])}'>{_h(d['after'])}</b></td>"
+            f"<td class='barcell'><div class='bar'>"
+            f"<div class='barfill barbefore' style='width:{d['before']}%'></div>"
+            f"<div class='barfill barafter' style='width:{d['after']}%'></div>"
+            f"</div></td></tr>"
+        )
+    table = (
+        "<table class='scoretable'><thead><tr><th>観点</th><th>重み</th>"
+        "<th>改善前</th><th>改善後</th><th>スコア（薄=前 / 濃=後）</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+    note = (
+        "<p class='note'>※ 整理健全度＝重複の排除・旧版の隔離・散在の解消・案件のまとまり"
+        "を重み付けした目安値（100点満点）。案件のまとまりは"
+        + ("LLM が束ねた案件単位" if sc["has_projects"] else "同名資料の単位")
+        + "で分散を評価。対象ファイル "
+        + str(sc["total_files"]) + " 件（構成ファイルを除く）。</p>"
+    )
+    return big + table + note
 
 
 def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
@@ -173,9 +226,9 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
     after = after_mermaid(analysis.proposed_tree)
     summary = analysis.summary
     llm_note = (
-        "LLM補助（Azure OpenAI）：有効"
+        "LLM補助（プロジェクト束ね）：有効"
         if analysis.llm_used
-        else "LLM補助（Azure OpenAI）：無効（ルールベースのみ）"
+        else "LLM補助：無効（据置中心・重複統合/旧版隔離のみ）"
     )
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -213,6 +266,23 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
   pre.mmsrc {{ white-space:pre-wrap; font-size:.75rem; background:#f0f0f0; padding:8px; }}
   details summary {{ cursor:pointer; font-size:.8rem; color:#1f5fa8; }}
   .note {{ font-size:.8rem; color:#666; }}
+  .scorewrap {{ display:flex; align-items:center; justify-content:center; gap:24px;
+               flex-wrap:wrap; margin:6px 0 18px; }}
+  .scorebox {{ text-align:center; background:#f4f7fb; border:1px solid #e2e5ea;
+              border-radius:12px; padding:14px 26px; min-width:150px; }}
+  .scorecap {{ font-size:.8rem; color:#555; }}
+  .scoreval {{ font-size:3rem; font-weight:800; line-height:1.1; }}
+  .scoreval .max {{ font-size:1rem; font-weight:600; color:#888; }}
+  .scoregrade {{ font-size:.9rem; color:#444; letter-spacing:.1em; }}
+  .scorearrow {{ font-size:2rem; color:#1f3a5f; text-align:center; }}
+  .scoredelta {{ font-size:1rem; font-weight:700; color:#0a7d33; }}
+  table.scoretable td.num {{ text-align:right; white-space:nowrap; }}
+  .dimdetail {{ font-size:.72rem; color:#777; }}
+  .barcell {{ min-width:160px; width:34%; }}
+  .bar {{ position:relative; height:16px; background:#eceff3; border-radius:8px; }}
+  .barfill {{ position:absolute; top:0; left:0; height:100%; border-radius:8px; }}
+  .barbefore {{ background:#c7d4e6; }}
+  .barafter {{ background:#1f5fa8; height:8px; top:4px; }}
 </style></head>
 <body>
 <header>
@@ -225,6 +295,11 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
     {_summary_cards(summary)}
     <p class="note">※ 更新日・作成者は開閉や雛形の影響で実態を反映しないため低信頼として扱い、
        重複判定は内容ハッシュ（SHA-256）を用いています。</p>
+  </section>
+
+  <section>
+    <h2>整理健全度スコア（改善前 → 改善後）</h2>
+    {_score_section(scan, analysis)}
   </section>
 
   <section>
@@ -248,11 +323,6 @@ def build_html(scan: ScanResult, analysis: AnalysisResult) -> str:
   <section>
     <h2>資料種別の内訳</h2>
     {_category_table(analysis)}
-  </section>
-
-  <section>
-    <h2>命名規約・フォルダ体系の提案</h2>
-    {_naming_block(summary)}
   </section>
 
   <section>

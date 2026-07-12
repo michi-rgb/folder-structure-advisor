@@ -172,7 +172,7 @@ def get_provider(provider_name: str = "auto") -> LLMProvider:
 
 
 class LLMHelper:
-    """分類・命名規約提案の補助。内部でプロバイダに委譲する。"""
+    """プロジェクト束ね・分類補助。内部でプロバイダに委譲する。"""
 
     def __init__(
         self, provider_name: str = "auto", provider: Optional[LLMProvider] = None
@@ -191,6 +191,43 @@ class LLMHelper:
     def last_error(self) -> Optional[str]:
         return getattr(self.provider, "last_error", None)
 
+    def cluster_projects(
+        self, entries: list[dict[str, str]]
+    ) -> Optional[dict[str, str]]:
+        """ファイル群を「プロジェクト/案件」単位に束ねる（主エンジン）。
+
+        入力は [{"path": 相対パス, "name": ファイル名}, ...]。現在のフォルダ位置
+        （パス）と名前の類似性を手がかりに、同じ案件のファイルへ同じラベルを付ける。
+        戻り値は {相対パス: プロジェクトラベル}。判断できないものは省略される。
+
+        重要: ファイル種別（画像／文書／PDF 等）では束ねない。異なるプロジェクトが
+        種別で混ざるのを避けるための設計上の要件。
+        """
+        if not self.available or not entries:
+            return None
+        sample = entries[:300]  # 送信量を抑える
+        system = (
+            "あなたは社内ファイル整理の専門家です。"
+            "与えられたファイル群を『プロジェクト/案件』単位に束ねてください。"
+            "手がかりは、案件名・取引先名・テーマ・ファイル名の類似性、および"
+            "現在のフォルダ位置（パス）です。"
+            "重要な制約: 画像・文書・PDF・表計算などの『ファイル種別』では束ねないこと。"
+            "種別で束ねると異なるプロジェクトが混ざってしまうため禁止です。"
+            "ラベルは、既に多くのファイルが置かれている既存フォルダ名を"
+            "できるだけそのまま使ってください（新しい呼称の乱立を避けるため）。"
+            "出力は JSON オブジェクトで、キーを与えられたパス文字列、"
+            "値をプロジェクトラベル（日本語・簡潔）としてください。"
+            "自信を持って判断できないファイルはキーごと省略して構いません。"
+            "ファイル内容は与えられません。パスと名前から推測してください。"
+        )
+        user = "ファイル一覧（現在の相対パス）:\n" + "\n".join(
+            f"- {e['path']}" for e in sample
+        )
+        data = self.provider.chat_json(system, user)
+        if not isinstance(data, dict):
+            return None
+        return {k: v for k, v in data.items() if isinstance(v, str) and v.strip()}
+
     def suggest_categories(self, names: list[str]) -> Optional[dict[str, str]]:
         """ファイル名リストから {ファイル名: カテゴリ} の意味分類案を返す。"""
         if not self.available or not names:
@@ -207,24 +244,3 @@ class LLMHelper:
         if not isinstance(data, dict):
             return None
         return {k: v for k, v in data.items() if isinstance(v, str)}
-
-    def suggest_naming_convention(
-        self, sample_names: list[str], categories: list[str]
-    ) -> Optional[dict]:
-        """命名規約・フォルダ体系の提案を返す（構造化 JSON）。"""
-        if not self.available:
-            return None
-        system = (
-            "あなたは社内のファイル整理ルール策定を支援する専門家です。"
-            "与えられたファイル名の傾向とカテゴリ一覧をもとに、"
-            "命名規約案とフォルダ体系案を提案してください。"
-            "出力は JSON で、キー naming_rule（命名規約の文字列）、"
-            "folder_policy（フォルダ体系の方針の文字列）、"
-            "examples（改善後ファイル名の例の配列）を含めてください。"
-        )
-        user = (
-            "カテゴリ一覧: " + ", ".join(categories) + "\n\n"
-            "ファイル名の例:\n" + "\n".join(f"- {n}" for n in sample_names[:100])
-        )
-        data = self.provider.chat_json(system, user)
-        return data if isinstance(data, dict) else None

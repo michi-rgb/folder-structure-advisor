@@ -19,6 +19,7 @@ from pathlib import Path
 from .classifier import classify_all
 from .duplicates import detect_exact_duplicates
 from .enrich import enrich
+from .filters import is_structural
 from .llm import LLMHelper
 from .models import AnalysisResult, ScanResult
 from .proposer import build_proposal
@@ -39,39 +40,33 @@ def _save_json(obj: dict, path: Path) -> None:
 
 
 def _analyze(scan: ScanResult, use_llm: bool, llm_provider: str = "auto") -> AnalysisResult:
+    # 資料種別は補助メタ情報（レポートの内訳列）として保持。整頓の主軸ではない。
     category_counts = classify_all(scan.files)
 
-    naming_suggestion = None
+    project_of = None
     llm_used = False
     if use_llm:
         helper = LLMHelper(provider_name=llm_provider)
         if helper.available:
             print(f"  [情報] LLM補助プロバイダ: {helper.provider_name}", file=sys.stderr)
-            # 意味分類でカテゴリを上書き（取れた分だけ）。
-            names = [f.name for f in scan.files]
-            cats = helper.suggest_categories(names)
-            if cats:
-                for f in scan.files:
-                    if f.name in cats and cats[f.name]:
-                        f.category = cats[f.name]
-                        f.category_source = "llm"
-                # 件数を数え直す。
-                category_counts.clear()
-                for f in scan.files:
-                    category_counts[f.category] += 1
+            # 主エンジン：ファイルをプロジェクト/案件単位に束ねる（種別では束ねない）。
+            entries = [
+                {"path": f.path, "name": f.name}
+                for f in scan.files
+                if not is_structural(f.name)
+            ]
+            project_of = helper.cluster_projects(entries)
+            if project_of:
                 llm_used = True
-            naming_suggestion = helper.suggest_naming_convention(
-                names, sorted(set(f.category for f in scan.files if f.category))
-            )
-            if naming_suggestion:
-                llm_used = True
+                print(f"  [情報] プロジェクト割当: {len(project_of)} 件", file=sys.stderr)
         else:
             print("  [情報] LLM接続情報（Azure OpenAI / Mistral）が無いため"
-                  "ルールベースで実行します。", file=sys.stderr)
+                  "、プロジェクト集約は行わず据置中心（重複統合・旧版隔離のみ）で"
+                  "実行します。", file=sys.stderr)
 
     dups = detect_exact_duplicates(scan.files)
     series = detect_version_series(scan.files)
-    analysis = build_proposal(scan, dups, series, category_counts, naming_suggestion)
+    analysis = build_proposal(scan, dups, series, category_counts, project_of)
     analysis.llm_used = llm_used
     return analysis
 
@@ -121,6 +116,7 @@ def _print_summary(analysis: AnalysisResult, paths: dict) -> None:
     print(f"  完全重複グループ : {s.get('duplicate_groups')} "
           f"(冗長コピー {s.get('redundant_copies')} 件)")
     print(f"  旧版の可能性     : {s.get('old_versions')} 件")
+    print(f"  プロジェクト     : {s.get('projects', 0)} 件（集約の束ね単位）")
     print(f"  アクション内訳   : {s.get('actions')}")
     print(f"  LLM補助          : {'有効' if analysis.llm_used else '無効(ルールベース)'}")
     print("=== 出力 ===")

@@ -134,6 +134,102 @@ class CoreTest(unittest.TestCase):
         # 見積書は「見積・請求」に分類される。
         self.assertIn("見積・請求", analysis.category_counts)
 
+    def test_no_clustering_keeps_structure(self) -> None:
+        # project_of 無し（LLM 無効）なら、既存構造を壊さず据置中心になる。
+        scan = enrich(scan_source(str(self.root)))
+        counts = classify_all(scan.files)
+        dups = detect_exact_duplicates(scan.files)
+        series = detect_version_series(scan.files)
+        analysis = build_proposal(scan, dups, series, counts)
+        for m in analysis.move_plan:
+            if m.action == "据置":
+                # 据置は現在地のまま（第一階層を種別で作り直したりしない）。
+                self.assertEqual(m.current_path, m.proposed_path)
+            elif m.action == "移動":
+                self.fail(f"クラスタ無しで移動が発生: {m.current_path} -> {m.proposed_path}")
+
+    def test_home_folder_is_dominant_existing_folder(self) -> None:
+        # 集約先（ホーム）は、そのプロジェクトが最も多く在る既存フォルダになる。
+        from folder_advisor.clustering import assign_projects, resolve_home_folders
+
+        scan = enrich(scan_source(str(self.root)))
+        project_of = {
+            "a/見積書_v1.txt": "見積案件",
+            "a/見積書_v2.txt": "見積案件",
+            "b/見積書_v2 - コピー.txt": "見積案件",
+        }
+        projects = assign_projects(scan.files, project_of)
+        home = resolve_home_folders(scan.files, projects)
+        # a/ が 2 件で最多 → ホームは "a"。
+        self.assertEqual(home["見積案件"], "a")
+
+    def test_project_consolidation_gathers_scatter(self) -> None:
+        # 散在した同一プロジェクトのメンバーが、ホーム（a/）配下へ寄せられる。
+        scan = enrich(scan_source(str(self.root)))
+        counts = classify_all(scan.files)
+        dups = detect_exact_duplicates(scan.files)
+        series = detect_version_series(scan.files)
+        project_of = {
+            "a/見積書_v1.txt": "見積案件",
+            "a/見積書_v2.txt": "見積案件",
+            "b/見積書_v2 - コピー.txt": "見積案件",
+        }
+        analysis = build_proposal(scan, dups, series, counts, project_of=project_of)
+        plan = {m.current_path: m for m in analysis.move_plan}
+        # クラスタメンバーの提案先はすべてホーム a/ 配下。
+        for path in project_of:
+            self.assertTrue(
+                plan[path].proposed_path.startswith("a/"),
+                f"{path} がホーム配下に集約されていない: {plan[path].proposed_path}",
+            )
+        # プロジェクトラベルが移動計画に伝播している。
+        self.assertEqual(plan["a/見積書_v1.txt"].project, "見積案件")
+        # v1 は旧版なので要確認（アーカイブ隔離）、最新 v2 は据置。
+        self.assertEqual(plan["a/見積書_v1.txt"].action, "要確認")
+        self.assertEqual(plan["a/見積書_v2.txt"].action, "据置")
+
+    def test_consolidation_only_from_staging(self) -> None:
+        # 集約は「一時/個人置き場」からの引き上げに限定。共有フォルダの正規ファイルや
+        # サブフォルダ配下は動かさない（最小変更）。空/汎用ファイルは対象外。
+        from folder_advisor.clustering import (
+            assign_projects,
+            consolidation_target,
+            is_staging_path,
+        )
+
+        self.assertTrue(is_staging_path("メール添付"))
+        self.assertTrue(is_staging_path("デスクトップ整理/新しいフォルダ"))
+        self.assertTrue(is_staging_path("個人フォルダ/田中"))
+        self.assertFalse(is_staging_path("営業/見積"))
+        self.assertFalse(is_staging_path("開発/設計"))
+
+        scan = enrich(scan_source(str(self.root)))
+        counts = classify_all(scan.files)
+        dups = detect_exact_duplicates(scan.files)
+        series = detect_version_series(scan.files)
+        # 見積案件: a/（共有・2件）と b/ に加え、（このツリーには無いので）
+        # 実運用の散在を想定して a/見積書 と個別に検証する。
+        project_of = {
+            "a/見積書_v1.txt": "見積案件",
+            "a/見積書_v2.txt": "見積案件",
+        }
+        projects = assign_projects(scan.files, project_of)
+        # 共有フォルダ a/ の正規ファイルは集約対象にならない（現在地維持）。
+        by_path = {f.path: f for f in scan.files}
+        from folder_advisor.clustering import resolve_home_folders
+
+        home = resolve_home_folders(scan.files, projects)
+        self.assertIsNone(
+            consolidation_target(by_path["a/見積書_v2.txt"], projects, home)
+        )
+
+        # 空ファイル・汎用名はそもそもプロジェクト割当から除外される。
+        empty_like = assign_projects(
+            scan.files,
+            {"e/スクリーンショット 2024-01-01.png": "画像案件"},
+        )
+        self.assertNotIn("e/スクリーンショット 2024-01-01.png", empty_like)
+
 
 if __name__ == "__main__":
     unittest.main()
