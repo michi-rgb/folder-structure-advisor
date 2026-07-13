@@ -1,149 +1,119 @@
-# folder_advisor — フォルダ構成 改善提案アプリ
+# folder_advisor — フォルダ体系を取得し、LLM で改善提案するアプリ
 
-散在・重複・旧版で無秩序になったフォルダを走査し、**既存の構造をできるだけ壊さずに
-整頓する改善案を提案**する CLI ツールです。第一階層を資料種別で作り直すような大改造は
-せず、**既定はすべて据置**。散在は**プロジェクト/案件単位**（ファイル名の類似性＋既存
-フォルダ文脈を LLM が判断）で最小限だけ集約します。実ファイルは一切変更せず
-（提案・可視化のみ）、before/after を **折り畳みツリー**と **Treemap（容量ヒート
-マップ）** で可視化した **HTML レポート**（外部 CDN 不要・オフライン表示可）と、
-**移動計画 CSV** を出力します。
+職場の「必要な資料に短時間でアクセスできない・どれが正/最新か分からない」という
+課題を解決するため、**フォルダ体系（構造メタデータのみ）を取得**し、
+**Azure OpenAI（Azure CLI 認証）** に分析させて、フォルダ体系・命名規則・版管理・
+オーナー制・ライフサイクルまで含む**改善提案レポート**を生成する CLI ツールです。
 
-> 背景・課題整理は [`docs/設計計画.md`](docs/設計計画.md) を参照。
+旧版（ファイル単位の重複統合ツール）をゼロから作り直した v2 です。
+背景の課題整理と設計は [`docs/設計.md`](docs/設計.md) を参照してください。
 
-## 特長（課題との対応）
+## 特長
 
-- **探索の困難（症状A）**：完全重複（内容ハッシュ）・近似重複・旧版系列を洗い出す。
-  **既存フォルダ構造を土台に据置を既定**とし、**一時/個人置き場に散在した**同一案件の
-  ファイルだけを、その案件の既存フォルダ（ホーム）へ引き上げる。共有フォルダの正規
-  ファイルやサブ構造は動かさない。**資料種別では束ねない**（異なる案件が種別で混ざる
-  のを避けるため）。
-- **信頼性の判断不能（症状B）**：更新日・作成者は「開閉で変わる／雛形の残存」で
-  実態を反映しないため**低信頼**として扱い、重複判定は当てにできる
-  **内容ハッシュ（SHA-256）** を一次情報にします。
-- **対象の切り替え**：Windows ローカルと SharePoint（OneDrive 同期フォルダ）を
-  `--mode` で切り替え。SharePoint は同期済みローカルパスとして走査します。
-- **プロジェクト束ねは LLM が主エンジン（Azure OpenAI / Mistral 切替）**：
-  ファイルの**相対パス（現在のフォルダ位置）とファイル名のリストのみ**を送り、
-  「どのファイルが同じ案件か」を LLM に判断させる（ルールでは案件判定が難しいため）。
-  接続情報が無い場合は集約を行わず、**据置中心（重複統合・旧版隔離のみ）で完全動作**。
-- **ノイズ除外**：`.gitignore` / `__init__.py` / `README` 等の**構成ファイル**や
-  **0バイトの空ファイル**、`スクリーンショット`等の**自動生成名**は、重複・旧版の
-  誤検出を避けるため統合候補・旧版系列から除外し、移動提案でも据え置きます。
+| 課題（原因） | 本ツールの出力 |
+|---|---|
+| 格納・命名・版管理のルールがない | 格納先の原則／標準フォルダ体系案／命名規則／版管理ルール（`運用ルール案.md`） |
+| 正式版と作業中が混在し正が不明 | 正式版/作業中の分離構成の提案 ＋ 混在フォルダの検出 |
+| 「正」のオーナーが未定義 | 体系案の各フォルダにオーナー役割を提案 |
+| 廃棄/アーカイブ運用の不在 | ライフサイクルルール ＋ 長期未更新フォルダの棚卸しリスト |
+| フォルダ乱立 | 汎用名・同名散在・空フォルダの検出、作成統制ルールの提案 |
+
+- **実ファイルには一切触れません**。読み取り（メタデータのみ）→ 提案レポート出力だけです。
+- LLM が使えない状況でも、ルールベースの所見＋テンプレート提案で**完全動作**します。
+
+## 通信量の削減（設計上の柱）
+
+1. **ファイル内容を読まない・送らない。** 収集するのはフォルダ構造の統計
+   （件数・容量・拡張子・代表ファイル名few件）だけ。
+2. **OneDrive 同期フォルダはローカルと同じ経路で走査。** stat 情報しか見ないため、
+   「ファイルオンデマンド」のクラウド専用ファイルを**ダウンロードさせません**
+   （通信ゼロ）。レポートにクラウド専用ファイル数を表示して確認できます。
+3. **Graph API 直結モードは delta クエリ。** 初回はメタデータのみ
+   （1 ファイルあたり数百バイト）、**2 回目以降は変更差分だけ**を取得します
+   （`out/onedrive_cache.json` に deltaLink とメタデータを保存）。
+4. **LLM へは圧縮ダイジェストを 1 回だけ送信。** フォルダ単位 1 行サマリに圧縮し、
+   既定で最大 400 フォルダ（`--max-digest-folders` で調整）。ファイル一覧は送りません。
 
 ## 動作環境
 
-- Python 3.10 以降（標準ライブラリのみで本体は動作。追加依存なし）
-- LLM補助を使う場合のみ `pip install -r requirements.txt`（`openai`）
+- Python 3.10 以降。スキャン・分析・レポートは**標準ライブラリのみ**で動作
+- LLM 提案を使う場合: `pip install -r requirements.txt`（openai / azure-identity）と Azure CLI（`az`）
 
 ## 使い方
 
 ```powershell
-# 1) まず動作確認用サンプルを生成（任意）
+# 0) 動作確認用サンプル（任意）
 python scripts/make_sample.py
+python -m folder_advisor run --source sample_data --out out --no-llm
 
-# 2) 一括実行：走査 → 分析 → レポート生成
-python -m folder_advisor run --source sample_data --out out
-
-# 実フォルダを対象にする例（ローカル）
+# 1) ローカルフォルダ
 python -m folder_advisor run --source "D:\共有ドライブ\部門フォルダ" --out out
 
-# SharePoint（OneDrive 同期済みフォルダ）を対象にする例
-python -m folder_advisor run --mode sharepoint --source "C:\Users\<you>\<会社名>\<サイト名> - Documents" --out out
+# 2) OneDrive 同期フォルダ（推奨。通信ゼロ）
+python -m folder_advisor run --source "C:\Users\<you>\OneDrive - <会社名>" --out out
+
+# 3) OneDrive を Graph API 直結でスキャン（同期していない場合。az login が必要）
+python -m folder_advisor run --source "onedrive:/ドキュメント/仕事" --out out
+#    SharePoint ドキュメントライブラリは --drive-id <driveId> で指定
 ```
 
-### サブコマンド
-
-| コマンド | 用途 |
-|---|---|
-| `scan`   | 走査＋ハッシュ＋信頼度付与のみ（`out/scan.json`） |
-| `report` | `--scan out/scan.json` か `--source` を入力に分析・提案・レポート生成 |
-| `run`    | 走査→分析→レポートを一括実行 |
-
-### 主なオプション
-
-- `--source PATH` 対象フォルダ
-- `--mode local|sharepoint` 対象種別（既定 local）
-- `--out DIR` 出力先（既定 `out`）
-- `--max-files N` 走査上限（大規模フォルダの試走用）
-- `--no-hash` 内容ハッシュ計算を省略（高速だが完全重複検出は無効）
-- `--llm` LLM補助を有効化（`report` / `run`。接続情報が必要）
-- `--llm-provider auto|azure|mistral` LLMプロバイダ選択（既定 `auto` = 認証情報が揃っている方）
-
-## LLM補助（Azure OpenAI / Mistral）の設定
-
-接続情報を受領したら環境変数を設定して `--llm` を付けます。プロバイダは
-`--llm-provider` で選べます（既定 `auto`）。未設定・失敗時は自動でルールベースに
-フォールバックします。
-
-**Azure OpenAI:**
-```powershell
-$env:AZURE_OPENAI_ENDPOINT    = "https://<resource>.openai.azure.com/"
-$env:AZURE_OPENAI_API_KEY     = "<api-key>"
-$env:AZURE_OPENAI_DEPLOYMENT  = "<deployment-name>"   # モデル名ではなくデプロイ名
-$env:AZURE_OPENAI_API_VERSION = "2024-10-21"
-python -m folder_advisor run --source sample_data --out out --llm --llm-provider azure
-```
-
-**Mistral:**
-```powershell
-$env:MISTRAL_API_KEY = "<api-key>"
-$env:MISTRAL_MODEL   = "mistral-large-latest"   # 省略可
-python -m folder_advisor run --source sample_data --out out --llm --llm-provider mistral
-```
-
-依存パッケージ（使う方のみ）: `pip install openai`（Azure）/ `pip install mistralai`（Mistral）。
-詳細は [`.env.example`](.env.example) を参照。
-
-## 出力物（`out/`）
+出力（`out/`）:
 
 | ファイル | 内容 |
 |---|---|
-| `report.html`   | 整理健全度スコア・before/after の折り畳みツリー / Treemap・重複表・旧版表・分類・移動計画 |
-| `move_plan.csv` | 全ファイルの `現在パス→提案パス→分類→アクション→根拠`（Excel 対応 BOM 付き） |
-| `graph.json`    | before/after の nodes/edges グラフデータ |
-| `scan.json` / `analysis.json` | 走査生データ・分析結果（再利用・監査用） |
+| `report.html` | サマリ・課題所見・改善後体系（before/after 折り畳みツリー）・移行計画・各種ルール。オフライン閲覧可 |
+| `運用ルール案.md` | そのまま職場に展開できるルール文書ドラフト |
+| `move_plan.csv` | フォルダ移行計画（Excel 対応 BOM 付き） |
+| `scan.json` | 走査結果（フォルダ単位の統計のみ。再利用可） |
 
-> **before/after の構造可視化**は、大規模フォルダで巨大化して判読できなくなる
-> mermaid 図を廃止し、レポート内蔵の JS（**外部 CDN 不要**）で描画する 2 種類に
-> 置き換えました。**折り畳みツリー**でフォルダを開閉しながら構造を辿れ、
-> **Treemap（容量ヒートマップ）** では面積＝容量・色が濃いほど大容量で、どこが
-> 容量を食っているか／整理でどう変わるかを俯瞰できます（フォルダをクリックで
-> 掘り下げ可能）。社内ネットワークでもオフラインで表示できます。
+### サブコマンドと主なオプション
 
-## 移動計画のアクション区分
+```
+scan     --source PATH|onedrive:[/subpath] [--drive-id ID] [--exclude PAT]... [--max-folders N] --out DIR
+propose  --scan out/scan.json [--no-llm] [--goal "追加要望"] [--max-digest-folders N] --out DIR
+run      scan + propose を一括実行
+```
 
-- **据置**：現状維持（構造変更なし）。**既定はこれ**で、大半のファイルが該当する
-- **移動**：**一時/個人置き場**（メール添付・個人フォルダ・デスクトップ・ダウンロード・
-  一時 等）に散在した案件ファイルだけを、その案件の既存の集約先（ホーム）へ引き上げる
-  提案（LLM 補助時のみ発生）。共有フォルダの正規ファイルやサブフォルダは動かさず、
-  一時/個人置き場そのものは集約先にしない（＝最小変更を徹底）
-- **統合**：内容が完全一致する冗長コピー。「正」1 本へ集約
-- **要確認**：旧版の可能性（系列の最新以外）。プロジェクトのホーム（無ければ現在地）
-  配下の `_アーカイブ(旧版)` へローカル隔離を提案
+`--goal` で LLM への追加要望を自由文で渡せます（例: `--goal "第一階層は部署別を維持したい"`）。
 
-## 設計上の重要な前提
+## Azure OpenAI の設定（Azure CLI 認証・API キー不要）
 
-- **実ファイルは変更しません**（第一版は提案・可視化のみ）。移動は CSV の提案に留めています。
-- 更新日・作成者は信頼できないため、版の新旧は**ファイル名中の版番号・日付**を優先します。
-- SharePoint は Graph API 直結ではなく**同期済みローカルパス**を前提とします
-  （`scanner.SourceBackend` を実装すれば将来 Graph API を追加可能）。
+```powershell
+az login                                    # 必要なら --tenant <tenant-id>
+$env:AZURE_OPENAI_ENDPOINT   = "https://<resource>.openai.azure.com/"
+$env:AZURE_OPENAI_DEPLOYMENT = "<deployment-name>"   # モデル名ではなくデプロイ名
+python -m folder_advisor run --source "..." --out out
+```
+
+- 対象リソースで自分のアカウントに **Cognitive Services OpenAI User** ロールが必要です。
+- トークンは azure-identity（`AzureCliCredential`）が自動取得・自動更新します。
+- 認証やロールが未整備の間は `--no-llm` でルールベース提案のみ利用できます。
+- 詳細は [`.env.example`](.env.example) を参照。
+
+## LLM に送る情報（社外秘への配慮）
+
+フォルダパス・件数・容量・拡張子内訳と、各フォルダの**代表ファイル名最大 4 件**のみです。
+ファイル内容・全ファイル一覧・作成者名は送信しません。代表ファイル名も出したくない
+場合は `digest.py` の `例[...]` 出力を無効化してください。
 
 ## モジュール構成
 
 ```
 folder_advisor/
-  scanner.py     走査（LocalBackend / SourceBackend 抽象）
-  enrich.py      内容ハッシュ・メタデータ信頼度
-  duplicates.py  完全重複・近似重複
-  versioning.py  旧版系列・名前正規化
-  classifier.py  資料種別のルールベース分類（レポートの補助メタ情報）
-  filters.py     構成ファイル/汎用名の判定（重複・旧版の誤検出を除外）
-  llm.py         LLM補助（プロジェクト束ねが主・Azure OpenAI / Mistral・フォールバック付き）
-  clustering.py  プロジェクト束ね＋集約先（ホーム）決定＋一時/個人置き場の限定集約
-  proposer.py    据置既定・散在集約の移動計画・改善後ツリー
-  scoring.py     整理健全度スコア（改善前後・100点満点）の算出
-  visualize.py   before/after の折り畳みツリー・Treemap 用データ・グラフ JSON
-  report.py      HTML レポート・CSV 出力
-  cli.py         コマンドライン
+  models.py         データモデル・ファイル名シグナル（版/作業中/確定の判定）
+  scan_local.py     ローカル/OneDrive同期フォルダ走査（メタデータのみ・非ハイドレート）
+  scan_onedrive.py  Microsoft Graph delta 走査（差分キャッシュ・$select 最小化）
+  analyzer.py       ルールベース課題所見（版乱立・混在・散在・平置き・深層・未更新）
+  digest.py         LLM 向け圧縮ダイジェスト（フォルダ数上限・省略注記）
+  prompts.py        システム/ユーザープロンプト（課題定義を内蔵）
+  llm.py            Azure OpenAI クライアント（AzureCliCredential）
+  propose.py        提案生成（LLM 主・失敗時ルールベースにフォールバック）
+  report.py         HTML レポート・運用ルール案.md・move_plan.csv
+  cli.py            scan / propose / run
 ```
+
+## テスト
+
+```bash
+python -m unittest discover -s tests -v
 ```
