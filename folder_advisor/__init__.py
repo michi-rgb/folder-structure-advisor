@@ -1,9 +1,8 @@
-"""folder_advisor: フォルダ構成の改善を提案する CLI アプリ。
+"""folder_advisor — フォルダ体系を取得し、LLM で改善提案するツール。
 
-散在・重複・旧版を洗い出し、内容の重複を最小化した改善後フォルダ構成を
-提案する。実ファイルは動かさず、提案（移動計画 CSV）と before/after 可視化
-（折り畳みツリー・Treemap 容量ヒートマップ・グラフ JSON）を含む HTML
-レポートを生成する。
+- 対象: ローカルフォルダ / OneDrive・SharePoint の同期済みローカルフォルダ
+- 収集: メタデータのみ（ファイル内容は読まない・送らない）
+- LLM: Azure OpenAI（Azure CLI 認証。API キー不要）
 """
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"

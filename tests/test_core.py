@@ -1,234 +1,198 @@
-"""コアロジックの回帰テスト（標準ライブラリ unittest のみ）。
+"""コアロジックのテスト（標準ライブラリ unittest のみ・ネットワーク不要）。
 
-実行: python -m unittest discover -s tests
-一時ディレクトリに散らかりフォルダを作って一連の処理を検証する。
+python -m unittest discover -s tests -v
 """
-
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from folder_advisor.classifier import classify_all
-from folder_advisor.duplicates import bytes_reclaimable, detect_exact_duplicates
-from folder_advisor.enrich import enrich
-from folder_advisor.proposer import build_proposal
-from folder_advisor.scanner import scan_source
-from folder_advisor.versioning import detect_version_series, normalize_name
-
-
-def _make_tree(root: Path) -> None:
-    files = {
-        "a/見積書_v1.txt": "AAA",
-        "a/見積書_v2.txt": "BBB",
-        "b/見積書_v2 - コピー.txt": "BBB",   # 完全重複
-        "c/logo.png": "IMG",
-        "c/img/logo.png": "IMG",             # 完全重複
-        "d/契約書.pdf": "CONTRACT",
-        "~$tmp.docx": "TEMP",                # 除外対象
-        # 構成ファイル（各所に存在して当然 → 重複/旧版に出してはいけない）
-        "a/.gitignore": "IGNORE_A",
-        "b/.gitignore": "IGNORE_B",
-        "a/__init__.py": "",                 # 空ファイル（0バイト）
-        "b/__init__.py": "",                 # 同名・同内容だが構成ファイル
-        "c/README.md": "READ_C",
-        "d/README.md": "READ_D",
-        # 汎用・自動生成名（版ではない）
-        "e/スクリーンショット 2024-01-01.png": "S1",
-        "e/スクリーンショット 2024-02-02.png": "S2",
-    }
-    for rel, content in files.items():
-        p = root / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+from folder_advisor.analyzer import analyze
+from folder_advisor.digest import build_digest, select_folders
+from folder_advisor.models import (
+    FolderStat,
+    Proposal,
+    ScanResult,
+    is_generic_dir_name,
+    name_signals,
+    series_key,
+)
+from folder_advisor.propose import make_proposal, _from_llm_json
+from folder_advisor.report import write_report
+from folder_advisor.scan_local import scan_local
 
 
-class CoreTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-        _make_tree(self.root)
+def _make_tree(root: str, spec: dict[str, list[str]]) -> None:
+    for rel, names in spec.items():
+        d = os.path.join(root, *rel.split("/")) if rel else root
+        os.makedirs(d, exist_ok=True)
+        for name in names:
+            with open(os.path.join(d, name), "w") as fp:
+                fp.write("x")
 
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
 
-    def test_scan_excludes_temp(self) -> None:
-        scan = scan_source(str(self.root))
-        names = {f.name for f in scan.files}
-        self.assertNotIn("~$tmp.docx", names)
-        self.assertEqual(len(scan.files), 14)
+class TestNameSignals(unittest.TestCase):
+    def test_series_key_strips_versions(self):
+        self.assertEqual(series_key("提案書_v1.pptx"), series_key("提案書_v2.pptx"))
+        self.assertEqual(series_key("提案書_最終.pptx"), series_key("提案書_v1.pptx"))
+        self.assertEqual(series_key("見積書_20240401.xlsx"), series_key("見積書_20240415.xlsx"))
+        self.assertNotEqual(series_key("提案書.pptx"), series_key("見積書.pptx"))
 
-    def test_reliability_marks_mtime_low(self) -> None:
-        scan = enrich(scan_source(str(self.root)))
-        f = scan.files[0]
-        self.assertEqual(f.reliability["modified"], "low")
-        self.assertEqual(f.reliability["hash"], "high")
+    def test_name_signals(self):
+        self.assertEqual(name_signals("報告_v2.docx"), (True, False, False))
+        self.assertEqual(name_signals("報告_作業中.docx"), (False, True, False))
+        self.assertEqual(name_signals("報告_確定.docx"), (False, False, True))
 
-    def test_exact_duplicates(self) -> None:
-        scan = enrich(scan_source(str(self.root)))
-        dups = detect_exact_duplicates(scan.files)
-        # 見積書 BBB × 2、logo IMG × 2 の 2 グループ。
-        self.assertEqual(len(dups), 2)
-        self.assertGreater(bytes_reclaimable(dups), 0)
-        for g in dups:
-            self.assertEqual(len(g.redundant), len(g.paths) - 1)
+    def test_generic_dir(self):
+        self.assertTrue(is_generic_dir_name("新しいフォルダ (2)"))
+        self.assertTrue(is_generic_dir_name("temp"))
+        self.assertFalse(is_generic_dir_name("A社向け提案"))
 
-    def test_normalize_name_strips_version(self) -> None:
-        self.assertEqual(normalize_name("見積書_v2"), normalize_name("見積書_v1"))
-        self.assertEqual(normalize_name("提案書（作業中）"), normalize_name("提案書_ドラフト").replace("ドラフト", "").strip() or "提案書")
 
-    def test_version_series_detected(self) -> None:
-        scan = enrich(scan_source(str(self.root)))
-        series = detect_version_series(scan.files)
-        bases = {s.base_name for s in series}
-        self.assertIn("見積書", bases)
+class TestLocalScan(unittest.TestCase):
+    def test_scan_metadata_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            _make_tree(root, {
+                "": [],
+                "共有/A案件": ["提案書_v1.pptx", "提案書_v2.pptx", "提案書_v3.pptx"],
+                "共有/.git": ["config"],  # 除外対象
+                "個人": ["メモ.txt"],
+            })
+            scan = scan_local(root)
+            paths = {f.path for f in scan.folders}
+            self.assertIn("共有/A案件", paths)
+            self.assertNotIn("共有/.git", paths)
+            a = next(f for f in scan.folders if f.path == "共有/A案件")
+            self.assertEqual(a.n_files, 3)
+            self.assertEqual(a.max_series, 3)
+            self.assertEqual(a.exts, {"pptx": 3})
+            self.assertTrue(a.last_modified)
 
-    def test_structural_files_not_duplicated(self) -> None:
-        # .gitignore / __init__.py（空）は完全重複グループに現れない。
-        scan = enrich(scan_source(str(self.root)))
-        dups = detect_exact_duplicates(scan.files)
-        dup_paths = {p for g in dups for p in g.paths}
-        for p in dup_paths:
-            self.assertFalse(
-                p.endswith(".gitignore") or p.endswith("__init__.py"),
-                f"構成ファイルが重複に混入: {p}",
-            )
+    def test_scan_save_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as root:
+            _make_tree(root, {"a/b": ["x.txt"]})
+            scan = scan_local(root)
+            p = os.path.join(root, "scan.json")
+            scan.save(p)
+            loaded = ScanResult.load(p)
+            self.assertEqual(loaded.total_files, scan.total_files)
+            self.assertEqual([f.path for f in loaded.folders], [f.path for f in scan.folders])
 
-    def test_generic_and_samename_not_versioned(self) -> None:
-        scan = enrich(scan_source(str(self.root)))
-        series = detect_version_series(scan.files)
-        bases = {s.base_name for s in series}
-        # スクリーンショット（汎用名）/ README（同名多数・構成）は系列にならない。
-        self.assertNotIn("スクリーンショット", bases)
-        self.assertNotIn("readme", bases)
-        # 見積書は本物の版なので系列に残る。
-        self.assertIn("見積書", bases)
+    def test_max_folders_truncates(self):
+        with tempfile.TemporaryDirectory() as root:
+            _make_tree(root, {f"d{i}": [] for i in range(10)})
+            scan = scan_local(root, max_folders=5)
+            self.assertTrue(scan.truncated)
+            self.assertEqual(len(scan.folders), 5)
 
-    def test_structural_kept_in_place(self) -> None:
-        from folder_advisor.classifier import classify_all
-        from folder_advisor.proposer import build_proposal
 
-        scan = enrich(scan_source(str(self.root)))
-        counts = classify_all(scan.files)
-        dups = detect_exact_duplicates(scan.files)
-        series = detect_version_series(scan.files)
-        analysis = build_proposal(scan, dups, series, counts)
-        for m in analysis.move_plan:
-            if m.current_path.endswith(".gitignore"):
-                self.assertEqual(m.action, "据置")
-                self.assertEqual(m.current_path, m.proposed_path)
+class TestAnalyzer(unittest.TestCase):
+    def _scan(self, **kw) -> ScanResult:
+        return ScanResult(folders=[FolderStat(**kw)])
 
-    def test_proposal_no_file_mutation(self) -> None:
-        scan = enrich(scan_source(str(self.root)))
-        before = {p.name for p in self.root.rglob("*") if p.is_file()}
-        counts = classify_all(scan.files)
-        dups = detect_exact_duplicates(scan.files)
-        series = detect_version_series(scan.files)
-        analysis = build_proposal(scan, dups, series, counts)
-        after = {p.name for p in self.root.rglob("*") if p.is_file()}
-        # 提案のみ：実ファイルは一切変わらない。
-        self.assertEqual(before, after)
-        # 全ファイルに移動計画がある。
-        self.assertEqual(len(analysis.move_plan), len(scan.files))
-        # 見積書は「見積・請求」に分類される。
-        self.assertIn("見積・請求", analysis.category_counts)
+    def test_version_chaos(self):
+        s = self._scan(path="a", depth=1, n_files=4, max_series=4)
+        kinds = {f.kind for f in analyze(s)}
+        self.assertIn("version_chaos", kinds)
 
-    def test_no_clustering_keeps_structure(self) -> None:
-        # project_of 無し（LLM 無効）なら、既存構造を壊さず据置中心になる。
-        scan = enrich(scan_source(str(self.root)))
-        counts = classify_all(scan.files)
-        dups = detect_exact_duplicates(scan.files)
-        series = detect_version_series(scan.files)
-        analysis = build_proposal(scan, dups, series, counts)
-        for m in analysis.move_plan:
-            if m.action == "据置":
-                # 据置は現在地のまま（第一階層を種別で作り直したりしない）。
-                self.assertEqual(m.current_path, m.proposed_path)
-            elif m.action == "移動":
-                self.fail(f"クラスタ無しで移動が発生: {m.current_path} -> {m.proposed_path}")
+    def test_deep_and_flat(self):
+        s = ScanResult(folders=[
+            FolderStat(path="a/b/c/d/e/f", depth=6),
+            FolderStat(path="dl", depth=1, n_files=150),
+        ])
+        kinds = {f.kind for f in analyze(s)}
+        self.assertIn("deep_nesting", kinds)
+        self.assertIn("flat_overload", kinds)
 
-    def test_home_folder_is_dominant_existing_folder(self) -> None:
-        # 集約先（ホーム）は、そのプロジェクトが最も多く在る既存フォルダになる。
-        from folder_advisor.clustering import assign_projects, resolve_home_folders
+    def test_duplicate_folder_name(self):
+        s = ScanResult(folders=[
+            FolderStat(path="x/議事録", depth=2, n_files=1),
+            FolderStat(path="y/議事録", depth=2, n_files=1),
+        ])
+        kinds = {f.kind for f in analyze(s)}
+        self.assertIn("duplicate_folder_name", kinds)
 
-        scan = enrich(scan_source(str(self.root)))
-        project_of = {
-            "a/見積書_v1.txt": "見積案件",
-            "a/見積書_v2.txt": "見積案件",
-            "b/見積書_v2 - コピー.txt": "見積案件",
+
+class TestDigest(unittest.TestCase):
+    def test_budget_keeps_ancestors(self):
+        folders = [FolderStat(path="", depth=0)]
+        for i in range(50):
+            folders.append(FolderStat(path=f"top{i}", depth=1, n_files=1))
+            folders.append(FolderStat(path=f"top{i}/deep/leaf", depth=3, n_files=100 - i))
+            folders.append(FolderStat(path=f"top{i}/deep", depth=2))
+        scan = ScanResult(folders=sorted(folders, key=lambda f: f.path))
+        selected, omitted = select_folders(scan, max_folders=60)
+        paths = {f.path for f in selected}
+        for f in selected:
+            if "/" in f.path:
+                self.assertIn(f.path.rsplit("/", 1)[0], paths)  # 祖先が含まれる
+        self.assertTrue(sum(omitted.values()) > 0)
+
+    def test_digest_text(self):
+        scan = ScanResult(folders=[
+            FolderStat(path="共有/A案件", depth=2, n_files=3, size=1500,
+                       exts={"pptx": 3}, samples=["提案書_v1.pptx"], max_series=3),
+        ])
+        text = build_digest(scan)
+        self.assertIn("共有/A案件", text)
+        self.assertIn("版乱立x3", text)
+        self.assertIn("提案書_v1.pptx", text)
+
+
+class TestPropose(unittest.TestCase):
+    def test_fallback_without_llm(self):
+        scan = ScanResult(source="/x", folders=[
+            FolderStat(path="共有", depth=1, n_files=2, max_series=3),
+        ])
+        proposal, findings = make_proposal(scan, use_llm=False)
+        self.assertEqual(proposal.generated_by, "rules")
+        self.assertTrue(proposal.principles)
+        self.assertTrue(proposal.target_tree)
+        self.assertTrue(any(f.kind == "version_chaos" for f in findings))
+
+    def test_llm_json_parsing_is_lenient(self):
+        raw = {
+            "principles": ["p1", None],
+            "target_tree": [{"path": "10_x", "purpose": "y"}, "junk"],
+            "folder_mapping": "not-a-list",
+            "naming_rules": ["n1"],
         }
-        projects = assign_projects(scan.files, project_of)
-        home = resolve_home_folders(scan.files, projects)
-        # a/ が 2 件で最多 → ホームは "a"。
-        self.assertEqual(home["見積案件"], "a")
+        p = _from_llm_json(raw)
+        self.assertEqual(p.principles, ["p1"])
+        self.assertEqual(p.target_tree[0]["path"], "10_x")
+        self.assertEqual(p.target_tree[0]["owner_role"], "")
+        self.assertEqual(p.folder_mapping, [])
+        self.assertEqual(p.generated_by, "llm")
 
-    def test_project_consolidation_gathers_scatter(self) -> None:
-        # 散在した同一プロジェクトのメンバーが、ホーム（a/）配下へ寄せられる。
-        scan = enrich(scan_source(str(self.root)))
-        counts = classify_all(scan.files)
-        dups = detect_exact_duplicates(scan.files)
-        series = detect_version_series(scan.files)
-        project_of = {
-            "a/見積書_v1.txt": "見積案件",
-            "a/見積書_v2.txt": "見積案件",
-            "b/見積書_v2 - コピー.txt": "見積案件",
-        }
-        analysis = build_proposal(scan, dups, series, counts, project_of=project_of)
-        plan = {m.current_path: m for m in analysis.move_plan}
-        # クラスタメンバーの提案先はすべてホーム a/ 配下。
-        for path in project_of:
-            self.assertTrue(
-                plan[path].proposed_path.startswith("a/"),
-                f"{path} がホーム配下に集約されていない: {plan[path].proposed_path}",
-            )
-        # プロジェクトラベルが移動計画に伝播している。
-        self.assertEqual(plan["a/見積書_v1.txt"].project, "見積案件")
-        # v1 は旧版なので要確認（アーカイブ隔離）、最新 v2 は据置。
-        self.assertEqual(plan["a/見積書_v1.txt"].action, "要確認")
-        self.assertEqual(plan["a/見積書_v2.txt"].action, "据置")
+    def test_llm_failure_falls_back(self):
+        scan = ScanResult(folders=[FolderStat(path="a", depth=1, n_files=1)])
+        with mock.patch("folder_advisor.llm.chat_json", side_effect=RuntimeError("boom")):
+            proposal, _ = make_proposal(scan, use_llm=True)
+        self.assertEqual(proposal.generated_by, "rules")
 
-    def test_consolidation_only_from_staging(self) -> None:
-        # 集約は「一時/個人置き場」からの引き上げに限定。共有フォルダの正規ファイルや
-        # サブフォルダ配下は動かさない（最小変更）。空/汎用ファイルは対象外。
-        from folder_advisor.clustering import (
-            assign_projects,
-            consolidation_target,
-            is_staging_path,
+
+class TestReport(unittest.TestCase):
+    def test_write_report_outputs(self):
+        scan = ScanResult(source="/x", scanned_at="2026-07-13",
+                          folders=[FolderStat(path="a", depth=1, n_files=1, samples=["f.txt"])])
+        proposal = Proposal(
+            principles=["p"], naming_rules=["n"],
+            target_tree=[{"path": "10_プロジェクト", "purpose": "案件", "owner_role": "責任者"}],
+            folder_mapping=[{"from": "a", "to": "10_プロジェクト/a", "action": "移動", "reason": "r"}],
         )
-
-        self.assertTrue(is_staging_path("メール添付"))
-        self.assertTrue(is_staging_path("デスクトップ整理/新しいフォルダ"))
-        self.assertTrue(is_staging_path("個人フォルダ/田中"))
-        self.assertFalse(is_staging_path("営業/見積"))
-        self.assertFalse(is_staging_path("開発/設計"))
-
-        scan = enrich(scan_source(str(self.root)))
-        counts = classify_all(scan.files)
-        dups = detect_exact_duplicates(scan.files)
-        series = detect_version_series(scan.files)
-        # 見積案件: a/（共有・2件）と b/ に加え、（このツリーには無いので）
-        # 実運用の散在を想定して a/見積書 と個別に検証する。
-        project_of = {
-            "a/見積書_v1.txt": "見積案件",
-            "a/見積書_v2.txt": "見積案件",
-        }
-        projects = assign_projects(scan.files, project_of)
-        # 共有フォルダ a/ の正規ファイルは集約対象にならない（現在地維持）。
-        by_path = {f.path: f for f in scan.files}
-        from folder_advisor.clustering import resolve_home_folders
-
-        home = resolve_home_folders(scan.files, projects)
-        self.assertIsNone(
-            consolidation_target(by_path["a/見積書_v2.txt"], projects, home)
-        )
-
-        # 空ファイル・汎用名はそもそもプロジェクト割当から除外される。
-        empty_like = assign_projects(
-            scan.files,
-            {"e/スクリーンショット 2024-01-01.png": "画像案件"},
-        )
-        self.assertNotIn("e/スクリーンショット 2024-01-01.png", empty_like)
+        with tempfile.TemporaryDirectory() as out:
+            paths = write_report(out, scan, analyze(scan), proposal)
+            html_text = Path(paths["html"]).read_text(encoding="utf-8")
+            self.assertIn("10_プロジェクト", html_text)
+            self.assertNotIn("http://", html_text)  # 外部リソース非依存
+            self.assertNotIn("https://", html_text)
+            csv_text = Path(paths["csv"]).read_text(encoding="utf-8-sig")
+            self.assertIn("10_プロジェクト/a", csv_text)
+            md_text = Path(paths["rules"]).read_text(encoding="utf-8")
+            self.assertIn("命名規則", md_text)
 
 
 if __name__ == "__main__":
