@@ -4,6 +4,8 @@
 課題を解決するため、**フォルダ体系（構造メタデータのみ）を取得**し、
 **Azure OpenAI（Azure CLI 認証）** に分析させて、フォルダ体系・命名規則・版管理・
 オーナー制・ライフサイクルまで含む**改善提案レポート**を生成する CLI ツールです。
+対象はローカルフォルダと OneDrive/SharePoint の**同期済みローカルフォルダ**です
+（Graph API 等の社外 API は使いません。外部通信は Azure OpenAI への提案依頼 1 回のみ）。
 
 旧版（ファイル単位の重複統合ツール）をゼロから作り直した v2 です。
 背景の課題整理と設計は [`docs/設計.md`](docs/設計.md) を参照してください。
@@ -27,11 +29,9 @@
    （件数・容量・拡張子・代表ファイル名few件）だけ。
 2. **OneDrive 同期フォルダはローカルと同じ経路で走査。** stat 情報しか見ないため、
    「ファイルオンデマンド」のクラウド専用ファイルを**ダウンロードさせません**
-   （通信ゼロ）。レポートにクラウド専用ファイル数を表示して確認できます。
-3. **Graph API 直結モードは delta クエリ。** 初回はメタデータのみ
-   （1 ファイルあたり数百バイト）、**2 回目以降は変更差分だけ**を取得します
-   （`out/onedrive_cache.json` に deltaLink とメタデータを保存）。
-4. **LLM へは圧縮ダイジェストを 1 回だけ送信。** フォルダ単位 1 行サマリに圧縮し、
+   （走査による通信ゼロ）。レポートにクラウド専用ファイル数を表示して確認できます。
+   Graph API 等のクラウド API は使用しません（職場の API 制限に抵触しない）。
+3. **LLM へは圧縮ダイジェストを 1 回だけ送信。** フォルダ単位 1 行サマリに圧縮し、
    既定で最大 400 フォルダ（`--max-digest-folders` で調整）。ファイル一覧は送りません。
 
 ## 動作環境
@@ -49,13 +49,16 @@ python -m folder_advisor run --source sample_data --out out --no-llm
 # 1) ローカルフォルダ
 python -m folder_advisor run --source "D:\共有ドライブ\部門フォルダ" --out out
 
-# 2) OneDrive 同期フォルダ（推奨。通信ゼロ）
+# 2) OneDrive 同期フォルダ（走査による通信ゼロ）
 python -m folder_advisor run --source "C:\Users\<you>\OneDrive - <会社名>" --out out
 
-# 3) OneDrive を Graph API 直結でスキャン（同期していない場合。az login が必要）
-python -m folder_advisor run --source "onedrive:/ドキュメント/仕事" --out out
-#    SharePoint ドキュメントライブラリは --drive-id <driveId> で指定
+# 3) Teams/SharePoint のドキュメントライブラリも「同期」済みならローカルパスで対象にできる
+python -m folder_advisor run --source "C:\Users\<you>\<会社名>\<サイト名> - ドキュメント" --out out
 ```
+
+> スキャン対象にしたい OneDrive/SharePoint フォルダが未同期の場合は、エクスプローラー
+> または SharePoint サイトの「同期」ボタンで同期してから実行してください。
+> 「ファイルオンデマンド」が有効なら実体のダウンロードは発生しません。
 
 出力（`out/`）:
 
@@ -69,7 +72,7 @@ python -m folder_advisor run --source "onedrive:/ドキュメント/仕事" --ou
 ### サブコマンドと主なオプション
 
 ```
-scan     --source PATH|onedrive:[/subpath] [--drive-id ID] [--exclude PAT]... [--max-folders N] --out DIR
+scan     --source PATH [--exclude PAT]... [--max-folders N] --out DIR
 propose  --scan out/scan.json [--no-llm] [--goal "追加要望"] [--max-digest-folders N] --out DIR
 run      scan + propose を一括実行
 ```
@@ -102,7 +105,6 @@ python -m folder_advisor run --source "..." --out out
 folder_advisor/
   models.py         データモデル・ファイル名シグナル（版/作業中/確定の判定）
   scan_local.py     ローカル/OneDrive同期フォルダ走査（メタデータのみ・非ハイドレート）
-  scan_onedrive.py  Microsoft Graph delta 走査（差分キャッシュ・$select 最小化）
   analyzer.py       ルールベース課題所見（版乱立・混在・散在・平置き・深層・未更新）
   digest.py         LLM 向け圧縮ダイジェスト（フォルダ数上限・省略注記）
   prompts.py        システム/ユーザープロンプト（課題定義を内蔵）

@@ -92,7 +92,7 @@ class FolderStat:
 class ScanResult:
     schema_version: int = SCAN_SCHEMA_VERSION
     source: str = ""
-    backend: str = "local"  # local / onedrive-graph
+    backend: str = "local"  # ローカル/同期フォルダ走査
     scanned_at: str = ""
     folders: list[FolderStat] = field(default_factory=list)
     truncated: bool = False  # max-folders 到達で打ち切ったか

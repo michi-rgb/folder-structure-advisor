@@ -1,8 +1,11 @@
 """コマンドライン。
 
-  python -m folder_advisor scan    --source <path|onedrive:[/subpath]> --out out
+  python -m folder_advisor scan    --source <フォルダパス> --out out
   python -m folder_advisor propose --scan out/scan.json --out out [--no-llm] [--goal "..."]
   python -m folder_advisor run     --source ... --out out [--no-llm]
+
+OneDrive は同期済みローカルフォルダを --source に指定する（メタデータのみ読むため
+クラウド専用ファイルはダウンロードされない）。
 """
 from __future__ import annotations
 
@@ -14,22 +17,11 @@ from folder_advisor.models import ScanResult
 from folder_advisor.propose import make_proposal
 from folder_advisor.report import write_report
 
-ONEDRIVE_PREFIX = "onedrive:"
-
 
 def _do_scan(args: argparse.Namespace) -> ScanResult:
     os.makedirs(args.out, exist_ok=True)
-    src: str = args.source
-    if src.lower().startswith(ONEDRIVE_PREFIX):
-        from folder_advisor.scan_onedrive import scan_onedrive
-        subpath = src[len(ONEDRIVE_PREFIX):]
-        scan = scan_onedrive(
-            subpath=subpath, drive_id=args.drive_id,
-            cache_dir=args.out, max_folders=args.max_folders,
-        )
-    else:
-        from folder_advisor.scan_local import scan_local
-        scan = scan_local(src, excludes=args.exclude, max_folders=args.max_folders)
+    from folder_advisor.scan_local import scan_local
+    scan = scan_local(args.source, excludes=args.exclude, max_folders=args.max_folders)
     scan_path = os.path.join(args.out, "scan.json")
     scan.save(scan_path)
     cloud = sum(f.n_cloud_only for f in scan.folders)
@@ -64,9 +56,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def add_scan_opts(p: argparse.ArgumentParser) -> None:
         p.add_argument("--source", required=True,
-                       help="対象フォルダ。ローカル/OneDrive同期パス、または 'onedrive:' / 'onedrive:/サブパス'（Graph API 直結）")
-        p.add_argument("--drive-id", default=None,
-                       help="Graph 直結時に対象ドライブ ID を指定（SharePoint ライブラリ等。省略時は自分の OneDrive）")
+                       help="対象フォルダ（ローカル、または OneDrive/SharePoint の同期済みローカルパス）")
         p.add_argument("--exclude", action="append", default=[],
                        help="除外パターン（fnmatch。複数指定可）")
         p.add_argument("--max-folders", type=int, default=20000, help="走査フォルダ数上限")

@@ -23,7 +23,6 @@ from folder_advisor.models import (
 from folder_advisor.propose import make_proposal, _from_llm_json
 from folder_advisor.report import write_report
 from folder_advisor.scan_local import scan_local
-from folder_advisor.scan_onedrive import _build_result, _item_dir_path
 
 
 def _make_tree(root: str, spec: dict[str, list[str]]) -> None:
@@ -173,29 +172,6 @@ class TestPropose(unittest.TestCase):
         with mock.patch("folder_advisor.llm.chat_json", side_effect=RuntimeError("boom")):
             proposal, _ = make_proposal(scan, use_llm=True)
         self.assertEqual(proposal.generated_by, "rules")
-
-
-class TestOneDriveBuild(unittest.TestCase):
-    def test_item_dir_path(self):
-        self.assertEqual(_item_dir_path({"parentReference": {"path": "/drive/root:"}}), "")
-        self.assertEqual(_item_dir_path({"parentReference": {"path": "/drives/x/root:/A/B"}}), "A/B")
-        self.assertIsNone(_item_dir_path({"parentReference": {}}))
-
-    def test_build_result_with_subpath(self):
-        items = {
-            "1": {"name": "仕事", "dir": "", "is_folder": True, "size": 0, "mtime": ""},
-            "2": {"name": "A案件", "dir": "仕事", "is_folder": True, "size": 0, "mtime": ""},
-            "3": {"name": "提案_v1.pptx", "dir": "仕事/A案件", "is_folder": False, "size": 10, "mtime": "2026-01"},
-            "4": {"name": "提案_v2.pptx", "dir": "仕事/A案件", "is_folder": False, "size": 12, "mtime": "2026-02"},
-            "5": {"name": "無関係.txt", "dir": "私物", "is_folder": False, "size": 5, "mtime": "2026-01"},
-        }
-        result = _build_result(items, "仕事", max_folders=100)
-        paths = {f.path for f in result.folders}
-        self.assertEqual(paths, {"", "A案件"})
-        a = next(f for f in result.folders if f.path == "A案件")
-        self.assertEqual(a.n_files, 2)
-        self.assertEqual(a.max_series, 2)
-        self.assertEqual(a.last_modified, "2026-02")
 
 
 class TestReport(unittest.TestCase):
