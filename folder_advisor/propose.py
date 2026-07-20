@@ -14,13 +14,15 @@ def make_proposal(
     use_llm: bool = True,
     goal: str = "",
     max_digest_folders: int = 400,
+    provider: str = "azure",
 ) -> tuple[Proposal, list[Finding]]:
     findings = analyze(scan)
     if use_llm:
         digest = build_digest(scan, max_digest_folders)
         try:
             from folder_advisor.llm import chat_json
-            raw = chat_json(SYSTEM_PROMPT, build_user_prompt(scan, digest, findings, goal))
+            raw = chat_json(SYSTEM_PROMPT, build_user_prompt(scan, digest, findings, goal), provider=provider)
+            print("[llm] LLM からの応答を受信しました（提案の生成に成功）。")
             return _from_llm_json(raw), findings
         except Exception as e:  # 設定不足・認証失敗・API エラーはすべてフォールバック
             print(f"[warn] LLM 呼び出しに失敗したためルールベース提案に切り替えます: {e}", file=sys.stderr)

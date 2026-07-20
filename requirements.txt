@@ -1,4 +1,7 @@
 # スキャン・分析・レポートは標準ライブラリのみで動作します（追加依存なし）。
-# LLM 提案（Azure OpenAI / Azure CLI 認証）を使う場合のみ以下をインストール:
+# LLM 提案を使う場合のみ、利用するプロバイダ（LLM_PROVIDER）に応じてインストール:
+#   azure（既定）: openai, azure-identity
+#   mistral      : mistralai
 openai>=1.35.0
 azure-identity>=1.17.0
+mistralai>=1.0.0

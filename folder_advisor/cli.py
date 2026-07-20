@@ -1,11 +1,13 @@
 """コマンドライン。
 
   python -m folder_advisor scan    --source <フォルダパス> --out out
-  python -m folder_advisor propose --scan out/scan.json --out out [--no-llm] [--goal "..."]
-  python -m folder_advisor run     --source ... --out out [--no-llm]
+  python -m folder_advisor propose --scan out/scan.json --out out [--no-llm] [--goal "..."] [--llm-provider azure|mistral]
+  python -m folder_advisor run     --source ... --out out [--no-llm] [--llm-provider azure|mistral]
 
 OneDrive は同期済みローカルフォルダを --source に指定する（メタデータのみ読むため
 クラウド専用ファイルはダウンロードされない）。
+--llm-provider は既定 azure。API キー・モデル名などの秘匿情報は環境変数から読み取る
+（Azure: AZURE_OPENAI_*、Mistral: MISTRAL_API_KEY / MISTRAL_MODEL）。
 """
 from __future__ import annotations
 
@@ -38,9 +40,13 @@ def _do_propose(scan: ScanResult, args: argparse.Namespace) -> None:
     proposal, findings = make_proposal(
         scan, use_llm=not args.no_llm, goal=args.goal,
         max_digest_folders=args.max_digest_folders,
+        provider=args.llm_provider,
     )
     paths = write_report(args.out, scan, findings, proposal)
-    engine = "Azure OpenAI" if proposal.generated_by == "llm" else "ルールベース（LLM 未使用）"
+    if proposal.generated_by == "llm":
+        engine = "Mistral API" if args.llm_provider == "mistral" else "Azure OpenAI"
+    else:
+        engine = "ルールベース（LLM 未使用）"
     print(f"[propose] 提案エンジン: {engine} / 所見 {len(findings)} 件")
     for k, p in paths.items():
         print(f"[out] {p}")
@@ -49,8 +55,8 @@ def _do_propose(scan: ScanResult, args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="folder_advisor",
-        description="フォルダ体系を取得し、Azure OpenAI（Azure CLI 認証）で改善提案するツール。"
-                    "ファイル内容は読まない・送らない（メタデータのみ）。",
+        description="フォルダ体系を取得し、Azure OpenAI または Mistral API（--llm-provider で切替）で"
+                    "改善提案するツール。ファイル内容は読まない・送らない（メタデータのみ）。",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -66,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--goal", default="", help="LLM への追加要望（自由文）")
         p.add_argument("--max-digest-folders", type=int, default=400,
                        help="LLM に送るダイジェストのフォルダ数上限（通信量・トークン削減）")
+        p.add_argument("--llm-provider", choices=["azure", "mistral"], default="azure",
+                       help="使用する LLM（既定: azure）。API キー・モデル名は環境変数から読み取ります。")
 
     p_scan = sub.add_parser("scan", help="フォルダ体系の取得のみ（scan.json 出力）")
     add_scan_opts(p_scan)

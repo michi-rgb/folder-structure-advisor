@@ -2,10 +2,11 @@
 
 職場の「必要な資料に短時間でアクセスできない・どれが正/最新か分からない」という
 課題を解決するため、**フォルダ体系（構造メタデータのみ）を取得**し、
-**Azure OpenAI（Azure CLI 認証）** に分析させて、フォルダ体系・命名規則・版管理・
-オーナー制・ライフサイクルまで含む**改善提案レポート**を生成する CLI ツールです。
+**Azure OpenAI または Mistral API**（CLI 引数 `--llm-provider` で切替）に分析させて、
+フォルダ体系・命名規則・版管理・オーナー制・ライフサイクルまで含む**改善提案レポート**を
+生成する CLI ツールです。
 対象はローカルフォルダと OneDrive/SharePoint の**同期済みローカルフォルダ**です
-（Graph API 等の社外 API は使いません。外部通信は Azure OpenAI への提案依頼 1 回のみ）。
+（Graph API 等の社外 API は使いません。外部通信は LLM への提案依頼 1 回のみ）。
 
 旧版（ファイル単位の重複統合ツール）をゼロから作り直した v2 です。
 背景の課題整理と設計は [`docs/設計.md`](docs/設計.md) を参照してください。
@@ -33,11 +34,16 @@
    Graph API 等のクラウド API は使用しません（職場の API 制限に抵触しない）。
 3. **LLM へは圧縮ダイジェストを 1 回だけ送信。** フォルダ単位 1 行サマリに圧縮し、
    既定で最大 400 フォルダ（`--max-digest-folders` で調整）。ファイル一覧は送りません。
+4. **送信前に確認プロンプトを表示。** 送信直前に推定トークン数（簡易見積もり）を
+   表示し、`y/n` で確認します。`n`（既定）と答えるとルールベース提案にフォールバック
+   します。
 
 ## 動作環境
 
 - Python 3.10 以降。スキャン・分析・レポートは**標準ライブラリのみ**で動作
-- LLM 提案を使う場合: `pip install -r requirements.txt`（openai / azure-identity）と Azure CLI（`az`）
+- LLM 提案を使う場合: `pip install -r requirements.txt`
+  - Azure OpenAI（既定）: openai / azure-identity と Azure CLI（`az`）
+  - Mistral API: mistralai
 
 ## 使い方
 
@@ -79,7 +85,17 @@ run      scan + propose を一括実行
 
 `--goal` で LLM への追加要望を自由文で渡せます（例: `--goal "第一階層は部署別を維持したい"`）。
 
-## Azure OpenAI の設定（Azure CLI 認証・API キー不要）
+## LLM プロバイダの設定
+
+使用する LLM は CLI 引数 `--llm-provider`（`azure`（既定） | `mistral`）で切り替えます。
+API キー・モデル名などの秘匿情報は環境変数から読み取ります。
+
+```powershell
+python -m folder_advisor run --source "..." --out out --llm-provider azure     # 既定。省略可
+python -m folder_advisor run --source "..." --out out --llm-provider mistral   # Mistral に切替
+```
+
+### Azure OpenAI（既定・Azure CLI 認証・API キー不要）
 
 ```powershell
 az login                                    # 必要なら --tenant <tenant-id>
@@ -90,7 +106,26 @@ python -m folder_advisor run --source "..." --out out
 
 - 対象リソースで自分のアカウントに **Cognitive Services OpenAI User** ロールが必要です。
 - トークンは azure-identity（`AzureCliCredential`）が自動取得・自動更新します。
-- 認証やロールが未整備の間は `--no-llm` でルールベース提案のみ利用できます。
+
+### Mistral API
+
+API キーとモデル名は **Windows のシステム環境変数**として設定してください（プロセス限りの
+`$env:` ではなく、コントロールパネルの「システム環境変数」または以下のコマンドで永続化します。
+反映には端末の再起動、または新しいターミナルセッションが必要です）。
+
+```powershell
+[Environment]::SetEnvironmentVariable("MISTRAL_API_KEY", "<api-key>", "Machine")
+[Environment]::SetEnvironmentVariable("MISTRAL_MODEL", "mistral-large-latest", "Machine")
+```
+
+設定後、新しいターミナルで:
+
+```powershell
+pip install mistralai
+python -m folder_advisor run --source "..." --out out --llm-provider mistral
+```
+
+- 認証やキー設定が未整備の間は `--no-llm` でルールベース提案のみ利用できます。
 - 詳細は [`.env.example`](.env.example) を参照。
 
 ## LLM に送る情報（社外秘への配慮）
@@ -108,7 +143,7 @@ folder_advisor/
   analyzer.py       ルールベース課題所見（版乱立・混在・散在・平置き・深層・未更新）
   digest.py         LLM 向け圧縮ダイジェスト（フォルダ数上限・省略注記）
   prompts.py        システム/ユーザープロンプト（課題定義を内蔵）
-  llm.py            Azure OpenAI クライアント（AzureCliCredential）
+  llm.py            Azure OpenAI / Mistral API クライアント（--llm-provider で切替）
   propose.py        提案生成（LLM 主・失敗時ルールベースにフォールバック）
   report.py         HTML レポート・運用ルール案.md・move_plan.csv
   cli.py            scan / propose / run
